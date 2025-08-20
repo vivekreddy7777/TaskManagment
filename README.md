@@ -1,11 +1,9 @@
-
-using BTA;
-using Microsoft.Data.SqlClient;
+using BTA_CompareTool_Service;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Serilog;
+using System.Configuration;
 
 namespace BTA_CompareTool_Service
 {
@@ -13,54 +11,58 @@ namespace BTA_CompareTool_Service
     {
         public static async Task Main(string[] args)
         {
+            // bootstrap logging
             Log.Logger = new LoggerConfiguration()
                 .MinimumLevel.Information()
-                .WriteTo.File(AppDomain.CurrentDomain.BaseDirectory + "\\logs\\log.txt",
-                              rollingInterval: RollingInterval.Day,
-                              rollOnFileSizeLimit: true)
+                .WriteTo.Console()
+                .WriteTo.File(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "service.log"),
+                    rollingInterval: RollingInterval.Day)
                 .CreateLogger();
 
             try
             {
-                Log.Information("== Service bootstrap ==");
+                Log.Information("=== Service bootstrap starting ===");
 
-                var env = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA";
-
+                // load initial settings (env, json, etc.)
                 IConfigurationRoot config = new ConfigurationBuilder()
                     .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
-                    .AddJsonFile($"appsettings.{env}.json", optional: true, reloadOnChange: true)
                     .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA"}.json",
+                        optional: true, reloadOnChange: true)
                     .AddEnvironmentVariables()
                     .Build();
 
-                // (Optional) pull values from Config Server into AppSettings first
-                var configServerUrl = config["ConfigServerPath"];
+                // pull settings from config server into AppSettings
+                string? configServerUrl = config["ConfigServerPath"];
                 if (!string.IsNullOrWhiteSpace(configServerUrl))
                 {
                     var dict = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
                     foreach (dynamic kv in dict.Entries)
+                    {
                         System.Configuration.ConfigurationManager.AppSettings.Set(kv.Name, kv.Value);
+                    }
                 }
 
+                // read DB connection string from config
+                string? connStr = ConfigurationManager.AppSettings["QCoreDBConnectionString"];
+                if (string.IsNullOrWhiteSpace(connStr))
+                    throw new InvalidOperationException("QCoreDBConnectionString missing from configuration.");
+
+                // host + DI setup
                 var host = Host.CreateApplicationBuilder(args);
 
                 host.Logging.ClearProviders();
-                host.Logging.AddSerilog(Log.Logger, dispose: false);
-                if (OperatingSystem.IsWindows() && !Environment.UserInteractive)
-                    host.Logging.AddEventLog();
+                host.Logging.AddSerilog();
 
-                var connStr = host.Configuration.GetConnectionString("SqlServerConnection");
-                if (string.IsNullOrWhiteSpace(connStr))
-                    throw new InvalidOperationException("SqlServerConnection missing.");
+                // register EF DbContext
+                host.Services.AddDbContext<DBServerContext>(opt =>
+                    opt.UseSqlServer(connStr));
 
-                // Register EF context(s)
-                host.Services.AddDbContext<DBServerContext>(opt => opt.UseSqlServer(connStr));
-                host.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<DBServerContext>());
-
-                // Your services
+                // register jobs & services
                 host.Services.AddScoped<BTA_CompareTool_Job>();
                 host.Services.AddHostedService<CompareToolHostedService>();
 
+                Log.Information("Service starting...");
                 await host.Build().RunAsync();
             }
             catch (Exception ex)
@@ -72,29 +74,6 @@ namespace BTA_CompareTool_Service
             {
                 Log.CloseAndFlush();
             }
-        }
-    }
-
-    public class CompareToolHostedService : BackgroundService
-    {
-        private readonly IServiceProvider _services;
-        private readonly ILogger<CompareToolHostedService> _logger;
-
-        public CompareToolHostedService(IServiceProvider services, ILogger<CompareToolHostedService> logger)
-        {
-            _services = services;
-            _logger = logger;
-        }
-
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            _logger.LogInformation("CompareTool Service Started");
-
-            using var scope = _services.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<DBServerContext>();
-            var job = scope.ServiceProvider.GetRequiredService<BTA_CompareTool_Job>();
-
-            await job.RunAsync(stoppingToken);
         }
     }
 }
