@@ -1,94 +1,114 @@
 using System;
-using System.Data.Odbc;
-using Microsoft.Data.SqlClient;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 using Serilog;
+using Serilog.Events;
+using System.Configuration; // for ConfigurationManager.AppSettings
+using Microsoft.Data.SqlClient;
 
-namespace BTA_CompareTool_Console
+namespace BTA_CompareTool_Service
 {
-    internal class Program
+    public static class Program
     {
-        static int Main(string[] args)
+        public static async Task Main(string[] args)
         {
-            // 🔹 Initialize logger first
+            // --- logging first ---
             Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Debug()
-                .WriteTo.Console()
-                .WriteTo.File("logs\\CompareTool.log",
+                .MinimumLevel.Information()
+                .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+                .WriteTo.File(AppDomain.CurrentDomain.BaseDirectory + @"\logs\log.txt",
                               rollingInterval: RollingInterval.Day,
-                              rollOnFileSizeLimit: true,
-                              retainedFileCountLimit: 7)
+                              rollOnFileSizeLimit: true)
                 .CreateLogger();
 
             try
             {
-                Log.Information("=== CompareTool started ===");
+                Log.Information("== Service bootstrap ==");
+                
+                // env (optional; default QA per your screenshot flow)
+                var env = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA";
 
-                if (args.Length < 12)
-                {
-                    Log.Error("Invalid number of args. Expected 12, got {Count}", args.Length);
-                    return 2;
-                }
-
-                // Map args
-                string bulkInsertKey = args[0];
-                int wmId             = int.Parse(args[1]);
-                string fileName      = args[2];
-                int gridType         = int.Parse(args[3]);
-                int additional1      = int.Parse(args[4]);
-                string overrideType  = args[5];
-                string region        = args[6];
-                string tableName     = args[7];
-                string valTableName  = args[8];
-                string valTempTable  = args[9];
-                string tempTable     = args[10];
-                string environment   = args[11];
-
-                // 🔹 Load configuration
-                var config = new ConfigurationBuilder()
-                    .SetBasePath(AppContext.BaseDirectory)
+                // --- base config (appsettings + env) ---
+                IConfigurationRoot config = new ConfigurationBuilder()
+                    .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
                     .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                    .AddJsonFile($"appsettings.{env}.json", optional: true, reloadOnChange: true)
                     .AddEnvironmentVariables()
                     .Build();
 
-                string sqlConnStr  = config.GetConnectionString("SqlConnection");
-                string odbcConnStr = config.GetConnectionString("OdbcConnection");
+                // --- pull settings from Config Server and push into AppSettings (as per screenshot) ---
+                var configServerUrl = config["ConfigServerPath"];
+                if (!string.IsNullOrWhiteSpace(configServerUrl))
+                {
+                    // your existing helper; keep the name you already use
+                    var configServerSettings = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
 
-                using var sql = new SqlConnection(sqlConnStr);
-                using var db2 = new OdbcConnection(odbcConnStr);
+                    foreach (dynamic obj in configServerSettings.Entries)
+                    {
+                        string key = obj.Name;
+                        string value = obj.Value;
+                        System.Configuration.ConfigurationManager.AppSettings.Set(key, value);
+                        Log.Debug("ConfigServer: {Key} = {Value}", key, value);
+                    }
+                }
+                else
+                {
+                    Log.Warning("ConfigServerPath not set; skipping Config Server pull.");
+                }
 
-                sql.Open();
-                db2.Open();
+                // --- values used below (match your screenshot keys) ---
+                string sqlConnStr   = System.Configuration.ConfigurationManager.AppSettings.Get("QCoreDBConnectionString") ?? "";
+                string consoleAppPath = System.Configuration.ConfigurationManager.AppSettings.Get("consoleAppPath") ?? "";
 
-                Log.Information("Connections established. SQL: {Sql}, DB2: {Db2}", sqlConnStr, odbcConnStr);
+                if (string.IsNullOrWhiteSpace(sqlConnStr))
+                    throw new InvalidOperationException("QCoreDBConnectionString is missing after configuration load.");
+                if (string.IsNullOrWhiteSpace(consoleAppPath))
+                    Log.Warning("consoleAppPath is empty; console launcher features may fail.");
 
-                // 🔹 Run processor
-                var processor = new FullSequentialProcessor(
-                    sql,
-                    db2,
-                    bulkInsertKey,
-                    wmId,
-                    fileName,
-                    gridType,
-                    additional1,
-                    overrideType,
-                    region,
-                    tableName,
-                    valTableName,
-                    valTempTable,
-                    tempTable,
-                    environment
-                );
+                // (optional) quick sanity open so failures surface early
+                using (var test = new SqlConnection(sqlConnStr))
+                {
+                    await test.OpenAsync();
+                    Log.Information("SQL connectivity OK (QCore).");
+                }
 
-                processor.RunAll(continueOnFailure: false);
+                // --- host / DI setup (Windows Service friendly) ---
+                HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
+                builder.Services.AddWindowsService(options => options.ServiceName = "BTA_CompareTool_Service");
 
-                Log.Information("=== CompareTool completed successfully ===");
-                return 0;
+                // event log + console logging if you want both
+                builder.Logging.ClearProviders();
+                builder.Logging.AddEventLog(settings =>
+                {
+                    settings.SourceName = "BTA_CompareTool_Service";
+                });
+                builder.Logging.AddSerilog(Log.Logger, dispose: false);
+
+                // EF DbContext (the type name must match yours)
+                builder.Services.AddDbContext<DBServerContext>(options =>
+                {
+                    options.UseSqlServer(sqlConnStr, sql =>
+                    {
+                        sql.EnableRetryOnFailure();
+                    });
+                }, contextLifetime: ServiceLifetime.Transient, optionsLifetime: ServiceLifetime.Transient);
+
+                // register your job + hosted service
+                builder.Services.AddScoped<BTA_CompareTool_Job>();
+                builder.Services.AddHostedService<CompareToolHostedService>();
+
+                IHost host = builder.Build();
+                Log.Information("Service starting...");
+                await host.RunAsync();
             }
             catch (Exception ex)
             {
-                Log.Fatal(ex, "❌ CompareTool failed with error");
-                return 1;
+                Log.Fatal(ex, "Service failed to start");
+                // rethrow so VS shows the failure too
+                throw;
             }
             finally
             {
