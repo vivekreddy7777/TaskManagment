@@ -1,79 +1,88 @@
-using BTA_CompareTool_Service;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
-using Serilog;
-using System.Configuration;
-
-namespace BTA_CompareTool_Service
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 {
-    public static class Program
+    _logger.LogInformation("CompareTool Service Started");
+
+    // keep the scope alive for the duration of a single run
+    using var scope = _services.CreateScope();
+    var sp = scope.ServiceProvider;
+
+    // 1) spin up the service so ServiceControl loads module details (incl. MainRequestTable)
+    var svcLogger = sp.GetRequiredService<ILogger<BTA_Service>>();
+    var svc = new BTA_Service(
+        module: "CompareTool",
+        processor: null,
+        serviceProvider: sp,
+        logger: svcLogger);
+
+    // after BTA_Service ctor, ServiceControl has read module info from DB
+    // expose these however your BTA_Service does (property names may differ)
+    var moduleName = svc.ModuleName;              // "CompareTool"
+    var tableName  = svc.Control.MainRequestTable; // or svc.TableName/Control.TableName
+
+    // 2) choose what you want to run.
+    //    A) run a specific request-number from config (simple one-off)
+    //    B) or loop and consume messages from your queue (classic service mode)
+    // ---- A) one-off run by RequestNumber from config (optional) ----
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var requestNumberStr = cfg["RequestNumber"];  // put in appsettings or user-secrets if you want
+    if (!string.IsNullOrWhiteSpace(requestNumberStr) &&
+        long.TryParse(requestNumberStr, out var requestNumber))
     {
-        public static async Task Main(string[] args)
+        // base Job (requestId, module, table, IServiceProvider)
+        var baseJob = new Job(requestNumber, moduleName, tableName, sp);
+
+        // derived job that takes baseJob in its ctor (your pattern)
+        var compareJob = ActivatorUtilities.CreateInstance<BTA_CompareTool_Job>(sp, baseJob);
+
+        await compareJob.RunAsync(stoppingToken);
+        _logger.LogInformation("CompareTool job finished for request {req}.", requestNumber);
+        return; // done
+    }
+
+    // ---- B) queue-driven loop (simplified skeleton) ----
+    while (!stoppingToken.IsCancellationRequested)
+    {
+        try
         {
-            // bootstrap logging
-            Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Information()
-                .WriteTo.Console()
-                .WriteTo.File(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "service.log"),
-                    rollingInterval: RollingInterval.Day)
-                .CreateLogger();
+            // Your queue receive should come from ServiceControl/BTA_Service.
+            // Replace 'TryDequeueAsync' with your real method.
+            // It should return either an XML message body OR a request number.
+            var message = await svc.TryDequeueAsync(stoppingToken); // <-- implement this on your side
 
-            try
+            if (message == null)
             {
-                Log.Information("=== Service bootstrap starting ===");
-
-                // load initial settings (env, json, etc.)
-                IConfigurationRoot config = new ConfigurationBuilder()
-                    .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
-                    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA"}.json",
-                        optional: true, reloadOnChange: true)
-                    .AddEnvironmentVariables()
-                    .Build();
-
-                // pull settings from config server into AppSettings
-                string? configServerUrl = config["ConfigServerPath"];
-                if (!string.IsNullOrWhiteSpace(configServerUrl))
-                {
-                    var dict = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
-                    foreach (dynamic kv in dict.Entries)
-                    {
-                        System.Configuration.ConfigurationManager.AppSettings.Set(kv.Name, kv.Value);
-                    }
-                }
-
-                // read DB connection string from config
-                string? connStr = ConfigurationManager.AppSettings["QCoreDBConnectionString"];
-                if (string.IsNullOrWhiteSpace(connStr))
-                    throw new InvalidOperationException("QCoreDBConnectionString missing from configuration.");
-
-                // host + DI setup
-                var host = Host.CreateApplicationBuilder(args);
-
-                host.Logging.ClearProviders();
-                host.Logging.AddSerilog();
-
-                // register EF DbContext
-                host.Services.AddDbContext<DBServerContext>(opt =>
-                    opt.UseSqlServer(connStr));
-
-                // register jobs & services
-                host.Services.AddScoped<BTA_CompareTool_Job>();
-                host.Services.AddHostedService<CompareToolHostedService>();
-
-                Log.Information("Service starting...");
-                await host.Build().RunAsync();
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken); // idle wait
+                continue;
             }
-            catch (Exception ex)
+
+            Job baseJob;
+
+            if (message.RequestNumber.HasValue)
             {
-                Log.Fatal(ex, "Service failed to start");
-                throw;
+                baseJob = new Job(message.RequestNumber.Value, moduleName, tableName, sp);
             }
-            finally
+            else
             {
-                Log.CloseAndFlush();
+                // XML version – your 4.5 path: Job(string xmlMessage, string module, string table)
+                baseJob = new Job(message.XmlBody, moduleName, tableName);
+                // if your Job(xml,module,table) also needs IServiceProvider, add it to that ctor and pass 'sp'
             }
+
+            var compareJob = ActivatorUtilities.CreateInstance<BTA_CompareTool_Job>(sp, baseJob);
+            await compareJob.RunAsync(stoppingToken);
+
+            await svc.CompleteAsync(message, stoppingToken); // tell queue the message was processed
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unhandled error running CompareTool job.");
+            // optional: dead-letter/abandon the message
         }
     }
+
+    _logger.LogInformation("CompareTool Service stopping.");
 }
