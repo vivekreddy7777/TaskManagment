@@ -1,41 +1,43 @@
-private void SetTraceOutput()
+protected async Task<DataTable> GetMainRequests(string procName, CancellationToken ct = default)
 {
-    // Delete any previous log file for this module
-    var logFilePath = Path.Combine("C:\\Logs", $"{_module}_{DateTime.Now:yyyyMMdd}.log");
-    if (File.Exists(logFilePath))
-        File.Delete(logFilePath);
+    using var scope     = _scopeFactory.CreateScope();
+    var dbContext       = scope.ServiceProvider.GetRequiredService<DBServerContext>();
+    var conn            = (SqlConnection)dbContext.Database.GetDbConnection();
 
-    // Create new log file
-    using var writer = File.AppendText(logFilePath);
-    writer.WriteLine($"[{DateTime.Now}] Logging started for module {_module}");
+    var mustClose = conn.State != ConnectionState.Open;
+    if (mustClose) await conn.OpenAsync(ct);
 
-    // Keep reference if you want to write manually later
-    _logger.LogInformation("Logging started, file: {path}", logFilePath);
-}
-private async Task<bool> OkToStartAsync(SqlConnection conn, string module, string table, CancellationToken ct)
-{
-    using var cmd = new SqlCommand("FuncBTE_ServiceBroker_OkToStart", conn)
+    try
     {
-        CommandType = CommandType.StoredProcedure
-    };
-    cmd.Parameters.AddWithValue("@Module", module);
-    cmd.Parameters.AddWithValue("@ModuleName", table);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = procName;                    // e.g. "procBTE_CompareTool_MainRequest_SELECT"
+        cmd.CommandType = CommandType.StoredProcedure;
 
-    var dt = new DataTable();
-    using (var da = new SqlDataAdapter(cmd))
-    {
-        da.Fill(dt);
+        // --- parameters (typed; avoids AddWithValue pitfalls) ---
+        cmd.Parameters.Add("@Password",       SqlDbType.NVarChar, 50).Value = Constants.Password;
+        cmd.Parameters.Add("@Request_Number", SqlDbType.BigInt).Value       = Request_Number;
+        cmd.Parameters.Add("@UserID",         SqlDbType.NVarChar, 50).Value = UserID;
+
+        // Optional OUTPUT param (only if your proc defines it)
+        var procResultParam = cmd.Parameters.Add("@ProcResult", SqlDbType.Int);
+        procResultParam.Direction = ParameterDirection.Output;
+
+        // --- execute and load to DataTable ---
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var table = new DataTable();
+        table.Load(reader);
+
+        // Example: log the output value if present
+        if (procResultParam.Value != DBNull.Value)
+        {
+            var procResult = Convert.ToInt32(procResultParam.Value);
+            _logger.LogInformation("GetMainRequests: ProcResult={ProcResult}, Rows={Rows}", procResult, table.Rows.Count);
+        }
+
+        return table;
     }
-
-    if (dt.Rows.Count == 0)
-        return true;
-
-    var reason = dt.Rows[0]["Reason"]?.ToString();
-    if (!string.IsNullOrEmpty(reason))
+    finally
     {
-        _logger.LogWarning("Not ready to start: {reason}", reason);
-        return false;
+        if (mustClose) await conn.CloseAsync();
     }
-
-    return true;
 }
