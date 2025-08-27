@@ -1,174 +1,106 @@
-using System;
-using System.Data;
 using System.Diagnostics;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Serilog;
+using Serilog.Events;
+using Serilog.Sinks.EventLog;
 
-public async Task CallCompareTool(CancellationToken ct = default)
+namespace BTA_CompareTool_Service;
+
+public static class Program
 {
-    using var scope   = _scopeFactory.CreateScope();
-    var    dbContext = scope.ServiceProvider.GetRequiredService<DBServerContext>();
-    using var conn   = dbContext.Database.GetDbConnection();
-
-    var mustOpen = conn.State == ConnectionState.Closed;
-    if (mustOpen) await conn.OpenAsync(ct);
-
-    // We'll need these across the whole method
-    string bulkInsertKey, requestorId, fileName, gridType, additional,
-           overrideType, region, tableName, valTableName, valTempTableName,
-           tempTableName, environment;
-
-    try
+    public static async Task Main(string[] args)
     {
-        // ------------------------------------------------------------------
-        // 1) FIRST STORED PROCEDURE
-        // ------------------------------------------------------------------
-        using (var cmd = conn.CreateCommand())
+        // 1) Always pin the working directory to the app folder
+        Directory.SetCurrentDirectory(AppContext.BaseDirectory);
+
+        // 2) Bootstrap Serilog early + write to EventLog and file
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .MinimumLevel.Information()
+            .Enrich.FromLogContext()
+            .WriteTo.EventLog(
+                source: "BTA_CompareTool_Service",
+                logName: "Application",
+                manageEventSource: true)
+            .WriteTo.File(
+                Path.Combine(AppContext.BaseDirectory, "Logs", "service-boot.log"),
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 14)
+            .CreateLogger();
+
+        try
         {
-            cmd.CommandType = CommandType.StoredProcedure;
-            cmd.CommandText = "procCompareTool_ClaimBulkInsert";
+            Log.Information("=== Service bootstrap starting ===");
 
-            // INPUTS
-            Add(cmd, "@Password",   DbType.String, Constants.Password);
-            Add(cmd, "@WM_ID",      DbType.Int64,  RequestorID);
-            Add(cmd, "@Compare_ID", DbType.Int64,  Compare_ID);
-            Add(cmd, "@FileName",   DbType.String, FileName);
-            Add(cmd, "@GridType",   DbType.String, GridType);
-            Add(cmd, "@Additional", DbType.String, Additional);
-            Add(cmd, "@OverrideType", DbType.String, OverrideType);
-            Add(cmd, "@Region",     DbType.String, Region);
+            // 3) Build configuration (appsettings + environment + your config server)
+            var environment = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA";
 
-            // OUTPUTS
-            Add(cmd, "@ValidationErrors", DbType.Boolean, null, ParameterDirection.Output);
-            Add(cmd, "@BulkInsertKey",    DbType.String,  null, ParameterDirection.Output);
-            Add(cmd, "@TableName",        DbType.String,  null, ParameterDirection.Output);
-            Add(cmd, "@ValTableName",     DbType.String,  null, ParameterDirection.Output);
-            Add(cmd, "@ValTempTableName", DbType.String,  null, ParameterDirection.Output);
-            Add(cmd, "@TempTableName",    DbType.String,  null, ParameterDirection.Output);
-            Add(cmd, "@Environment",      DbType.String,  null, ParameterDirection.Output);
+            var preConfig = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables()
+                .Build();
 
-            await cmd.ExecuteNonQueryAsync(ct);
+            // Pull keys from your config server into in-memory AppSettings
+            var configServerUrl = preConfig["ConfigServerPath"];
+            if (string.IsNullOrWhiteSpace(configServerUrl))
+                throw new InvalidOperationException("ConfigServerPath missing from configuration.");
 
-            // Pull OUT params and normalize
-            bool   validationErrors = ToBool (GetOut(cmd, "@ValidationErrors"), false);
-            bulkInsertKey           = ToStr  (GetOut(cmd, "@BulkInsertKey"));
-            tableName               = ToStr  (GetOut(cmd, "@TableName"));
-            valTableName            = ToStr  (GetOut(cmd, "@ValTableName"));
-            valTempTableName        = ToStr  (GetOut(cmd, "@ValTempTableName"));
-            tempTableName           = ToStr  (GetOut(cmd, "@TempTableName"));
-            environment             = ToStr  (GetOut(cmd, "@Environment"));
+            var kv = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
+            foreach (dynamic e in kv.entries) // your helper returns { entries: [{name,value},...] }
+                System.Configuration.ConfigurationManager.AppSettings.Set((string)e.name, (string)e.value);
 
-            // Also normalize inputs we’ll pass to console as strings
-            requestorId = RequestorID.ToString();
-            fileName    = ToStr(FileName);
-            gridType    = ToStr(GridType);
-            additional  = ToStr(Additional);
-            overrideType= ToStr(OverrideType);
-            region      = ToStr(Region);
+            // Sanity check: required string
+            var coreCs = System.Configuration.ConfigurationManager.AppSettings["QCoreDBConnectionString"];
+            if (string.IsNullOrWhiteSpace(coreCs))
+                throw new InvalidOperationException("QCoreDBConnectionString missing from configuration.");
 
-            if (validationErrors)
-                _logger.LogWarning("Validation errors flagged by first SP.");
+            // 4) Proper Windows Service host  (this is the biggie)
+            var builder = Host.CreateDefaultBuilder(args)
+                .UseWindowsService()                 // REQUIRED on server
+                .UseSerilog((ctx, services, cfg) =>  // Full Serilog after Host config exists
+                {
+                    cfg.ReadFrom.Configuration(preConfig)
+                       .Enrich.FromLogContext()
+                       .WriteTo.EventLog(
+                           source: "BTA_CompareTool_Service",
+                           logName: "Application",
+                           manageEventSource: true)
+                       .WriteTo.File(
+                           Path.Combine(AppContext.BaseDirectory, "Logs", "service.log"),
+                           rollingInterval: RollingInterval.Day,
+                           retainedFileCountLimit: 14);
+                })
+                .ConfigureServices((ctx, services) =>
+                {
+                    // Your DI
+                    services.AddDbContext<DBServerContext>(opt => opt.UseSqlServer(coreCs),
+                                                           contextLifetime: ServiceLifetime.Scoped);
+
+                    services.AddHostedService<CompareToolHostedService>();
+                    // register any other singletons/options here
+                });
+
+            using var host = builder.Build();
+
+            Log.Information("Service starting...");
+            await host.RunAsync();
         }
-
-        // ------------------------------------------------------------------
-        // 2) CALL THE CONSOLE (12 ARGS)
-        // ------------------------------------------------------------------
-        var argsList = new[]
+        catch (Exception ex)
         {
-            bulkInsertKey, requestorId, fileName, gridType, additional,
-            overrideType, region, tableName, valTableName,
-            valTempTableName, tempTableName, environment
-        };
-
-        // Optional guard — console expects 12 args, none blank
-        if (argsList.Length != 12 || argsList.Any(string.IsNullOrWhiteSpace))
-            throw new InvalidOperationException("One or more required arguments for console call are missing/blank.");
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = _consoleExePath,           // e.g. \\server\share\BTA_CompareTool_Console.exe
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            CreateNoWindow = true
-        };
-
-        foreach (var arg in argsList)
-            psi.ArgumentList.Add(arg);
-
-        using (var process = Process.Start(psi)!)
-        {
-            string stdout = await process.StandardOutput.ReadToEndAsync();
-            string stderr = await process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync(ct);
-
-            _logger.LogInformation("Console exited {Code}. OUT: {Out} ERR: {Err}",
-                process.ExitCode, stdout, stderr);
-
-            if (process.ExitCode != 0)
-                throw new Exception($"Console failed with code {process.ExitCode}. {stderr}");
+            // If we failed before Serilog pipeline is up, at least log boot failure
+            try { Log.Fatal(ex, "Service failed to start"); }
+            finally { Log.CloseAndFlush(); }
+            // Ensure the SCM sees this as a crash
+            throw;
         }
-
-        // ------------------------------------------------------------------
-        // 3) SECOND STORED PROCEDURE
-        // ------------------------------------------------------------------
-        using (var next = conn.CreateCommand())
+        finally
         {
-            next.CommandType = CommandType.StoredProcedure;
-            next.CommandText = "procCompareTool_ClaimBulkInsert2";
-
-            Add(next, "@Password",     DbType.String, Constants.Password);
-            Add(next, "@BulkInsertKey",DbType.String, bulkInsertKey);
-            Add(next, "@WM_ID",        DbType.Int64,  RequestorID);
-            Add(next, "@Compare_ID",   DbType.Int64,  Compare_ID);
-            Add(next, "@FileName",     DbType.String, fileName);
-            Add(next, "@GridType",     DbType.String, gridType);
-            Add(next, "@Additional",   DbType.String, additional);
-            Add(next, "@OverrideType", DbType.String, overrideType);
-            Add(next, "@Region",       DbType.String, region);
-
-            await next.ExecuteNonQueryAsync(ct);
+            Log.CloseAndFlush();
         }
     }
-    catch (Exception ex)
-    {
-        _logger.LogError(ex, "Error in CallCompareTool");
-        throw;
-    }
-    finally
-    {
-        if (mustOpen) await conn.CloseAsync();
-    }
-}
-
-/* ------------------------ helpers ------------------------ */
-
-static void Add(IDbCommand c, string name, DbType type, object value, ParameterDirection dir = ParameterDirection.Input)
-{
-    var p = c.CreateParameter();
-    p.ParameterName = name;
-    p.DbType        = type;
-    p.Direction     = dir;
-    p.Value         = value ?? DBNull.Value;
-    c.Parameters.Add(p);
-}
-
-static object GetOut(IDbCommand c, string name)
-{
-    if (!c.Parameters.Contains(name)) return DBNull.Value;
-    var v = ((IDataParameter)c.Parameters[name]).Value;
-    return v ?? DBNull.Value;
-}
-
-static string ToStr(object v) =>
-    v == null || v == DBNull.Value ? string.Empty : Convert.ToString(v)!;
-
-static bool ToBool(object v, bool fallback = false)
-{
-    if (v == null || v == DBNull.Value) return fallback;
-    if (v is bool b) return b;
-    if (bool.TryParse(Convert.ToString(v), out var parsed)) return parsed;
-    if (v is int i) return i != 0;
-    return fallback;
 }
