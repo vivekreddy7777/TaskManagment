@@ -1,106 +1,149 @@
-using System.Diagnostics;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Serilog;
 using Serilog.Events;
-using Serilog.Sinks.EventLog;
 
-namespace BTA_CompareTool_Service;
+// using BTA;  // <-- keep your own namespaces
+// using BTA.CompareTool_Service; 
+// using BTA.CompareTool_Service.Data;  // DBServerContext
+// using BTA.CompareTool_Service.Services; // CompareToolHostedService
+// using BTA.ExternalDBCalls_Service;     // if you need others
+// using ReadConfigServer = YourNamespace.ReadConfigServer; // alias if helpful
 
-public static class Program
+namespace BTA.CompareTool_Service
 {
-    public static async Task Main(string[] args)
+    public static class Program
     {
-        // 1) Always pin the working directory to the app folder
-        Directory.SetCurrentDirectory(AppContext.BaseDirectory);
-
-        // 2) Bootstrap Serilog early + write to EventLog and file
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-            .MinimumLevel.Information()
-            .Enrich.FromLogContext()
-            .WriteTo.EventLog(
-                source: "BTA_CompareTool_Service",
-                logName: "Application",
-                manageEventSource: true)
-            .WriteTo.File(
-                Path.Combine(AppContext.BaseDirectory, "Logs", "service-boot.log"),
-                rollingInterval: RollingInterval.Day,
-                retainedFileCountLimit: 14)
-            .CreateLogger();
-
-        try
+        public static async Task Main(string[] args)
         {
-            Log.Information("=== Service bootstrap starting ===");
+            // 1) make sure relative paths are from the app folder
+            Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
-            // 3) Build configuration (appsettings + environment + your config server)
-            var environment = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA";
+            // 2) bootstrap Serilog early (no EventLog while debugging)
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+                .MinimumLevel.Information()
+                .Enrich.FromLogContext()
+                .WriteTo.Console()
+                .WriteTo.File(
+                    Path.Combine(AppContext.BaseDirectory, "Logs", "service-boot.log"),
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 14)
+                .CreateLogger();
 
-            var preConfig = new ConfigurationBuilder()
-                .SetBasePath(AppContext.BaseDirectory)
-                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
-                .AddEnvironmentVariables()
-                .Build();
+            try
+            {
+                Log.Information("=== Service bootstrap starting ===");
 
-            // Pull keys from your config server into in-memory AppSettings
-            var configServerUrl = preConfig["ConfigServerPath"];
-            if (string.IsNullOrWhiteSpace(configServerUrl))
-                throw new InvalidOperationException("ConfigServerPath missing from configuration.");
+                // 3) base configuration: appsettings + env
+                var environment =
+                    Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "QA";
 
-            var kv = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
-            foreach (dynamic e in kv.entries) // your helper returns { entries: [{name,value},...] }
-                System.Configuration.ConfigurationManager.AppSettings.Set((string)e.name, (string)e.value);
+                var preConfig = new ConfigurationBuilder()
+                    .SetBasePath(AppContext.BaseDirectory)
+                    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                    .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
 
-            // Sanity check: required string
-            var coreCs = System.Configuration.ConfigurationManager.AppSettings["QCoreDBConnectionString"];
-            if (string.IsNullOrWhiteSpace(coreCs))
-                throw new InvalidOperationException("QCoreDBConnectionString missing from configuration.");
+                // 4) pull keys from CONFIG SERVER and overlay them
+                var configServerUrl = preConfig["ConfigServerPath"];
+                Dictionary<string, string> serverValues = new(StringComparer.OrdinalIgnoreCase);
 
-            // 4) Proper Windows Service host  (this is the biggie)
-            var builder = Host.CreateDefaultBuilder(args)
-                .UseWindowsService()                 // REQUIRED on server
-                .UseSerilog((ctx, services, cfg) =>  // Full Serilog after Host config exists
+                if (!string.IsNullOrWhiteSpace(configServerUrl))
                 {
-                    cfg.ReadFrom.Configuration(preConfig)
-                       .Enrich.FromLogContext()
-                       .WriteTo.EventLog(
-                           source: "BTA_CompareTool_Service",
-                           logName: "Application",
-                           manageEventSource: true)
-                       .WriteTo.File(
-                           Path.Combine(AppContext.BaseDirectory, "Logs", "service.log"),
-                           rollingInterval: RollingInterval.Day,
-                           retainedFileCountLimit: 14);
-                })
-                .ConfigureServices((ctx, services) =>
+                    Log.Information("Reading config from server: {Url}", configServerUrl);
+
+                    // EXPECTED: returns something like IEnumerable<dynamic> with .name/.value
+                    var response = await ReadConfigServer.ReadConfigServerSettingsAsync(configServerUrl);
+
+                    foreach (var entry in response) // entry.name, entry.value
+                    {
+                        string key = Convert.ToString(entry.name);
+                        string val = Convert.ToString(entry.value);
+                        if (!string.IsNullOrWhiteSpace(key))
+                            serverValues[key] = val ?? string.Empty;
+                    }
+
+                    // also push into ConfigurationManager.AppSettings for legacy callers
+                    foreach (var kv in serverValues)
+                        System.Configuration.ConfigurationManager.AppSettings.Set(kv.Key, kv.Value);
+
+                    Log.Information("Loaded {Count} keys from config server.", serverValues.Count);
+                }
+                else
                 {
-                    // Your DI
-                    services.AddDbContext<DBServerContext>(opt => opt.UseSqlServer(coreCs),
-                                                           contextLifetime: ServiceLifetime.Scoped);
+                    Log.Warning("ConfigServerPath is empty; continuing with JSON/env only.");
+                }
 
-                    services.AddHostedService<CompareToolHostedService>();
-                    // register any other singletons/options here
-                });
+                // 5) final merged configuration (server overrides JSON/env)
+                var mergedConfig = new ConfigurationBuilder()
+                    .AddConfiguration(preConfig)
+                    .AddInMemoryCollection(serverValues) // last wins
+                    .Build();
 
-            using var host = builder.Build();
+                // sanity check: required connection string
+                var coreCs =
+                    mergedConfig.GetConnectionString("QCoreDBConnectionString")
+                    ?? mergedConfig["QCoreDBConnectionString"];
 
-            Log.Information("Service starting...");
-            await host.RunAsync();
-        }
-        catch (Exception ex)
-        {
-            // If we failed before Serilog pipeline is up, at least log boot failure
-            try { Log.Fatal(ex, "Service failed to start"); }
-            finally { Log.CloseAndFlush(); }
-            // Ensure the SCM sees this as a crash
-            throw;
-        }
-        finally
-        {
-            Log.CloseAndFlush();
+                if (string.IsNullOrWhiteSpace(coreCs))
+                    throw new InvalidOperationException("QCoreDBConnectionString missing from configuration.");
+
+                // 6) build the Windows Service host
+                var host = Host.CreateDefaultBuilder(args)
+                    .UseWindowsService()
+                    .UseSerilog((ctx, services, cfg) =>
+                    {
+                        cfg.ReadFrom.Configuration(mergedConfig)
+                           .Enrich.FromLogContext()
+                           .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+                           .WriteTo.File(
+                               Path.Combine(AppContext.BaseDirectory, "Logs", "service.log"),
+                               rollingInterval: RollingInterval.Day,
+                               retainedFileCountLimit: 14);
+
+                        // EventLog only when running as a service (VS users usually lack rights)
+                        if (!Environment.UserInteractive)
+                        {
+                            // requires Serilog.Sinks.EventLog package
+                            cfg.WriteTo.EventLog("BTA_CompareTool_Service",
+                                manageEventSource: true,
+                                source: "Application");
+                        }
+                    })
+                    .ConfigureServices(services =>
+                    {
+                        services.AddSingleton<IConfiguration>(mergedConfig);
+
+                        services.AddDbContext<DBServerContext>(opt =>
+                            opt.UseSqlServer(coreCs),
+                            contextLifetime: ServiceLifetime.Scoped);
+
+                        services.AddHostedService<CompareToolHostedService>();
+                    })
+                    .Build();
+
+                Log.Information("Service starting...");
+                await host.RunAsync();
+            }
+            catch (Exception ex)
+            {
+                // last-ditch logging
+                try { Log.Fatal(ex, "Service failed to start"); } catch { /* ignore */ }
+                throw;
+            }
+            finally
+            {
+                Log.CloseAndFlush();
+            }
         }
     }
 }
