@@ -1,82 +1,100 @@
-public async Task LoadInputFile()
+public void OpenWorkbook(string filename, bool readOnly = true)
 {
-    _logger.LogInformation("LoadInputFile started");
+    if (string.IsNullOrWhiteSpace(filename))
+        throw new ArgumentException("Filename cannot be null or empty", nameof(filename));
 
-    if (string.IsNullOrWhiteSpace(InputSourcePath))
-        throw new InvalidOperationException("InputSourcePath is not set.");
-
-    if (!File.Exists(InputSourcePath))
-        throw new FileNotFoundException("Input Excel not found", InputSourcePath);
-
-    var fileNameNoExt = Path.GetFileNameWithoutExtension(InputSourcePath);
-    var extFromInput  = Path.GetExtension(InputSourcePath)?.TrimStart('.');
-    var extToUse      = string.IsNullOrEmpty(FileType) ? extFromInput : FileType;
-
-    var location = File.Exists(InputSourcePath)
-        ? new FileUtilities(InputSourcePath)
-        : new FileUtilities(_sourceFolderLocation, fileNameNoExt, extToUse);
-
-    if (!string.Equals(extToUse, "xlsx", StringComparison.OrdinalIgnoreCase))
-    {
-        _logger.LogInformation("Input is not XLSX (.{Ext}); skipping Excel conversion.", extToUse);
-        return;
-    }
+    if (!File.Exists(filename))
+        throw new FileNotFoundException($"Excel file not found at path: {filename}", filename);
 
     try
     {
-        // 1. Temp Excel file (local copy)
-        string tempExcel = location.BuildFilePath(
-            GetWorkFolder("Compare"),
-            Constants.NewUniqueKey,
-            null,
-            "xlsx",
-            true,
-            false
+        // Log before opening
+        CurrentJob.LogInformation($"Opening Excel Workbook: {filename} (ReadOnly={readOnly})");
+
+        Workbook = Excel.Workbooks.Open(
+            filename,
+            UpdateLinks: 0,
+            ReadOnly: readOnly,
+            Format: 5,
+            Password: "",
+            WriteResPassword: "",
+            IgnoreReadOnlyRecommended: true,
+            Origin: XlPlatform.xlWindows,
+            Delimiter: "\t",
+            Editable: false,
+            Notify: false,
+            Converter: 0,
+            AddToMru: true,
+            Local: 1,
+            CorruptLoad: 0
         );
-
-        File.Copy(InputSourcePath, tempExcel, overwrite: true);
-        _logger.LogInformation("Copied input Excel: {src} -> {dst}", InputSourcePath, tempExcel);
-
-        // 2. Temp TXT file
-        location.CurrentFilePath = location.BuildFilePath(
-            null,
-            null,
-            "txt",
-            true,
-            false
-        );
-
-        _logger.LogInformation("Converting Excel to text @ {Output}", location.CurrentFilePath);
-
-        using (var xl = new ExcelObjects(this))
-        {
-            xl.OpenWorkbook(tempExcel, readOnly: true);
-            MultiThreadingQueue.UseOleMessageFilter(() =>
-            {
-                xl.SaveAsText(location.CurrentFilePath);
-            });
-        }
-
-        // 3. Cleanup Excel
-        FileUtilities.InitializePath(tempExcel, true, false);
-
-        // 4. Network TXT file
-        string networkTxt = location.BuildFilePath(
-            _tempNetworkFolderLocation,
-            null,
-            "txt",
-            true,
-            true
-        );
-
-        _logger.LogInformation("Transfer to Network location: {Target}", networkTxt);
-        await location.TransferFileAsync(true);
-
-        _logger.LogInformation("LoadInputFile End");
     }
     catch (Exception ex)
     {
-        _logger.LogError(ex, "LoadInputFile failed.");
+        CurrentJob.LogError(ex, $"Failed to open Excel workbook: {filename}");
         throw;
+    }
+}
+
+public void SaveAs(string filename)
+{
+    if (Workbook == null)
+        throw new InvalidOperationException("No workbook is open to save.");
+
+    if (string.IsNullOrWhiteSpace(filename))
+        throw new ArgumentException("Filename cannot be null or empty", nameof(filename));
+
+    try
+    {
+        CurrentJob.LogInformation($"Saving Excel workbook to: {filename}");
+        Workbook.SaveAs(filename);
+    }
+    catch (Exception ex)
+    {
+        CurrentJob.LogError(ex, $"Failed to save Excel workbook: {filename}");
+        throw;
+    }
+}
+public void SaveAsText(string filename)
+{
+    if (Workbook == null)
+        throw new InvalidOperationException("No workbook is open to save as text.");
+
+    if (string.IsNullOrWhiteSpace(filename))
+        throw new ArgumentException("Filename cannot be null or empty", nameof(filename));
+
+    try
+    {
+        CurrentJob.LogInformation($"Saving Excel workbook as text to: {filename}");
+        Workbook.SaveAs(
+            Filename: filename,
+            FileFormat: XlFileFormat.xlTextWindows,
+            AccessMode: XlSaveAsAccessMode.xlNoChange
+        );
+    }
+    catch (Exception ex)
+    {
+        CurrentJob.LogError(ex, $"Failed to save Excel workbook as text: {filename}");
+        throw;
+    }
+}
+public void Dispose()
+{
+    try
+    {
+        CurrentJob.LogInformation("Closing Excel application and releasing COM objects.");
+
+        Workbook?.Close(false);
+        Workbook = null;
+
+        Excel?.Quit();
+        Excel = null;
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+    catch (Exception ex)
+    {
+        CurrentJob.LogError(ex, "Error during Excel cleanup in Dispose()");
     }
 }
