@@ -1,65 +1,56 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
-using Microsoft.Office.Interop.Excel; // COM interop (Microsoft.Office.Interop.Excel)
-using ExcelApp = Microsoft.Office.Interop.Excel.Application;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Excel = Microsoft.Office.Interop.Excel; // <-- IMPORTANT
 
 namespace BTA
 {
     /// <summary>
-    /// Minimal, safe Excel COM wrapper used by CompareTool.
+    /// Thin wrapper around Excel COM for opening/saving/exporting text.
+    /// Make sure the project references Microsoft.Office.Interop.Excel.
     /// </summary>
     public sealed class ExcelObjects : IDisposable
     {
-        // Backing fields (so we can pass them by ref during COM release)
-        private ExcelApp? _excel;
-        private Workbook? _workBook;
+        private readonly ILogger? _logger;
 
-        // Optional context for logging (your job object) and a simple logging hook
-        public object? CurrentJob { get; }
-        private readonly Action<string>? _log;
+        private Excel.Application? _excel;
+        private Excel.Workbook? _workBook;
 
-        // Read-only accessors if you still want to inspect them
-        public ExcelApp? Excel => _excel;
-        public Workbook? WorkBook => _workBook;
+        public Excel.Application? Application => _excel;
+        public Excel.Workbook? Workbook => _workBook;
 
-        public ExcelObjects(object? jobDetails = default, Action<string>? log = default)
+        public ExcelObjects(ILogger? logger = null)
         {
-            CurrentJob = jobDetails;
-            _log = log;
+            _logger = logger;
         }
 
-        /// <summary>
-        /// Open Excel application (hidden, no prompts, macros disabled).
-        /// </summary>
-        public void Initialize()
+        /// <summary>Start Excel (no UI, macros disabled).</summary>
+        public async Task InitializeAsync()
         {
-            TryLog("Opening Excel application...");
+            TryLog("Starting Excel...");
+            await Task.Yield();
+
+            // Start Excel
+            _excel = new Excel.Application
+            {
+                Visible = false,
+                DisplayAlerts = false
+            };
+
+            // Disable macro automation security (no prompts)
             try
             {
-                _excel = new ExcelApp
-                {
-                    Visible = false,
-                    DisplayAlerts = false
-                };
-
-                // Disable macros (no security prompts)
-                // ReSharper disable once SuspiciousTypeConversion.Global
                 Excel.AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityForceDisable;
+            }
+            catch { /* not fatal on some installs */ }
 
-                TryLog("Excel application opened.");
-            }
-            catch
-            {
-                // Ensure we don’t leave a half-constructed COM object around
-                Dispose();
-                throw;
-            }
+            // sanity
+            if (_excel == null)
+                throw new InvalidOperationException("Failed to create Excel.Application.");
         }
 
-        /// <summary>
-        /// Opens a workbook at the given path.
-        /// </summary>
+        /// <summary>Open a workbook.</summary>
         public void OpenWorkbook(string filename, bool readOnly = true)
         {
             if (string.IsNullOrWhiteSpace(filename))
@@ -69,124 +60,103 @@ namespace BTA
                 throw new System.IO.FileNotFoundException($"Excel file not found at path: {filename}", filename);
 
             if (_excel is null)
-                throw new InvalidOperationException("Excel application is not initialized. Call Initialize() first.");
+                throw new InvalidOperationException("Excel application is not initialized. Call InitializeAsync() first.");
 
             TryLog($"Opening Excel workbook: {filename} (ReadOnly={readOnly})");
 
-            // Use named args to avoid the giant Open signature
+            // Named args avoid the large parameter list on COM method
             _workBook = _excel.Workbooks.Open(
                 Filename: filename,
                 ReadOnly: readOnly
             );
         }
 
-        /// <summary>
-        /// Saves the active workbook to the given path (same format).
-        /// </summary>
+        /// <summary>Save the active workbook (same format).</summary>
+        public void Save()
+        {
+            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
+            TryLog("Saving workbook...");
+            _workBook.Save();
+        }
+
+        /// <summary>Save As a new path (same format).</summary>
         public void SaveAs(string filename)
         {
-            if (_workBook is null)
-                throw new InvalidOperationException("No workbook is open.");
+            if (string.IsNullOrWhiteSpace(filename))
+                throw new ArgumentException("Filename cannot be null or empty.", nameof(filename));
+            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
 
             TryLog($"Saving workbook as: {filename}");
             _workBook.SaveAs(Filename: filename);
         }
 
-        /// <summary>
-        /// Exports the active workbook to a tab-delimited text file.
-        /// </summary>
+        /// <summary>Export as plain text (*.txt, tab-delimited).</summary>
         public void SaveAsText(string filename)
         {
-            if (_workBook is null)
-                throw new InvalidOperationException("No workbook is open.");
+            if (string.IsNullOrWhiteSpace(filename))
+                throw new ArgumentException("Filename cannot be null or empty.", nameof(filename));
+            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
 
-            TryLog($"Saving workbook as TEXT: {filename}");
+            TryLog($"Exporting workbook to text: {filename}");
+
             _workBook.SaveAs(
                 Filename: filename,
-                FileFormat: XlFileFormat.xlTextWindows,
-                AccessMode: XlSaveAsAccessMode.xlNoChange
+                FileFormat: Excel.XlFileFormat.xlTextWindows,
+                AccessMode: Excel.XlSaveAsAccessMode.xlNoChange
             );
         }
 
-        /// <summary>
-        /// Closes the current workbook (no save).
-        /// </summary>
+        /// <summary>Close the workbook (without saving changes).</summary>
         public void CloseWorkbook()
         {
-            try
-            {
-                _workBook?.Close(SaveChanges: false);
-            }
-            finally
-            {
-                ReleaseCom(ref _workBook);
-            }
+            TryLog("Closing workbook...");
+            try { _workBook?.Close(SaveChanges: false); }
+            finally { ReleaseCom(ref _workBook); }
         }
 
-        /// <summary>
-        /// Full cleanup for Excel COM.
-        /// </summary>
+        /// <summary>Dispose Excel and release COM.</summary>
         public void Dispose()
         {
             TryLog("Disposing Excel objects...");
 
-            // Close workbook first
-            try { _workBook?.Close(SaveChanges: false); } catch { /* ignore */ }
-            ReleaseCom(ref _workBook);
-
-            // Quit Excel app
-            try { _excel?.Quit(); } catch { /* ignore */ }
-            ReleaseCom(ref _excel);
-
-            // Encourage COM cleanup
             try
             {
+                // Close WB if still open
+                try { _workBook?.Close(SaveChanges: false); } catch { /* ignore */ }
+                ReleaseCom(ref _workBook);
+
+                // Quit Excel
+                try { _excel?.Quit(); } catch { /* ignore */ }
+                ReleaseCom(ref _excel);
+
+                // Encourage COM cleanup
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
             }
-            catch
-            {
-                // Best effort
-            }
+            catch { /* best effort */ }
         }
 
-        // ----------------- helpers -----------------
+        // -------- helpers --------
 
         private void TryLog(string message)
         {
-            try
+            if (!string.IsNullOrWhiteSpace(message))
             {
-                // Prefer delegate if provided
-                _log?.Invoke(message);
-
-                // Fallback to Debug to ensure something is written even without DI logger
-                Debug.WriteLine($"[ExcelObjects] {message}");
-            }
-            catch
-            {
-                // Never let logging break the flow
+                if (_logger != null) _logger.LogInformation(message);
+                else Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
             }
         }
 
-        private static void ReleaseCom<T>(ref T? com) where T : class
+        private static void ReleaseCom<T>(ref T? comObj) where T : class
         {
-            if (com is null) return;
-
-            try
+            if (comObj != null && Marshal.IsComObject(comObj))
             {
-                // Release RCW
-                Marshal.FinalReleaseComObject(com);
+                try { Marshal.FinalReleaseComObject(comObj); }
+                catch { /* ignore */ }
             }
-            catch
-            {
-                // ignore
-            }
-            finally
-            {
-                com = null;
-            }
+            comObj = null;
         }
     }
 }
