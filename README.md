@@ -1,162 +1,65 @@
-using System;
-using System.Runtime.InteropServices;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
-using Excel = Microsoft.Office.Interop.Excel; // <-- IMPORTANT
-
-namespace BTA
+using (var cmd = conn.CreateCommand())
 {
-    /// <summary>
-    /// Thin wrapper around Excel COM for opening/saving/exporting text.
-    /// Make sure the project references Microsoft.Office.Interop.Excel.
-    /// </summary>
-    public sealed class ExcelObjects : IDisposable
+    cmd.CommandType = CommandType.StoredProcedure;
+    cmd.CommandText = "procCompareTool_ClaimBulkInsert1";
+
+    // ===== INPUTS =====
+    cmd.Parameters.Add(new SqlParameter("@Password",     SqlDbType.VarChar, 10)   { Value = Constants.Password });
+
+    // GM_ID, RequestorID are VARCHAR in your proc
+    cmd.Parameters.Add(new SqlParameter("@GM_ID",        SqlDbType.VarChar, 50)   { Value = GM_ID ?? (object)DBNull.Value });
+    cmd.Parameters.Add(new SqlParameter("@RequestorID",  SqlDbType.VarChar, 50)   { Value = RequestorID ?? (object)DBNull.Value });
+
+    // FileName is NVARCHAR(500)
+    cmd.Parameters.Add(new SqlParameter("@FileName",     SqlDbType.NVarChar, 500) { Value = FileName ?? (object)DBNull.Value });
+
+    // GridType is INT in the proc
+    cmd.Parameters.Add(new SqlParameter("@GridType",     SqlDbType.Int)           { Value = GridType });
+
+    // Tweak lengths if your proc uses different sizes
+    cmd.Parameters.Add(new SqlParameter("@Additional",   SqlDbType.VarChar, 100)  { Value = Additional ?? (object)DBNull.Value });
+    cmd.Parameters.Add(new SqlParameter("@OverrideType", SqlDbType.VarChar, 50)   { Value = OverrideType ?? (object)DBNull.Value });
+    cmd.Parameters.Add(new SqlParameter("@Region",       SqlDbType.VarChar, 50)   { Value = Region ?? (object)DBNull.Value });
+
+    // ===== OUTPUTS =====
+    // BIT
+    var pValidationErrors = new SqlParameter("@ValidationErrors", SqlDbType.Bit)
+    { Direction = ParameterDirection.Output };
+    cmd.Parameters.Add(pValidationErrors);
+
+    // VARCHAR(28)
+    var pBulkInsertKey = new SqlParameter("@BulkInsertKey", SqlDbType.VarChar, 28)
+    { Direction = ParameterDirection.Output };
+    cmd.Parameters.Add(pBulkInsertKey);
+
+    // If your proc returns an error text (e.g., VARCHAR(MAX))
+    var pErrorText = new SqlParameter("@ErrorText", SqlDbType.VarChar, -1) // -1 => MAX
+    { Direction = ParameterDirection.Output };
+    cmd.Parameters.Add(pErrorText);
+
+    // SYSNAME => NVARCHAR(128)
+    var pTableName        = new SqlParameter("@TableName",        SqlDbType.NVarChar, 128) { Direction = ParameterDirection.Output };
+    var pValTableName     = new SqlParameter("@ValTableName",     SqlDbType.NVarChar, 128) { Direction = ParameterDirection.Output };
+    var pEvalTempTable    = new SqlParameter("@EvalTempTableName",SqlDbType.NVarChar, 128) { Direction = ParameterDirection.Output };
+    var pTempTableName    = new SqlParameter("@TempTableName",    SqlDbType.NVarChar, 128) { Direction = ParameterDirection.Output };
+    var pEnvironment      = new SqlParameter("@Environment",      SqlDbType.NVarChar, 50)  { Direction = ParameterDirection.Output }; // or input if proc expects input
+
+    cmd.Parameters.AddRange(new[]
     {
-        private readonly ILogger? _logger;
+        pTableName, pValTableName, pEvalTempTable, pTempTableName, pEnvironment
+    });
 
-        private Excel.Application? _excel;
-        private Excel.Workbook? _workBook;
+    await cmd.ExecuteNonQueryAsync(ct);
 
-        public Excel.Application? Application => _excel;
-        public Excel.Workbook? Workbook => _workBook;
+    // read outputs
+    bool   validationErrors = pValidationErrors.Value != DBNull.Value && (bool)pValidationErrors.Value;
+    string bulkInsertKey    = pBulkInsertKey.Value as string ?? "";
+    string tableName        = pTableName.Value as string ?? "";
+    string valTableName     = pValTableName.Value as string ?? "";
+    string evalTempTable    = pEvalTempTable.Value as string ?? "";
+    string tempTableName    = pTempTableName.Value as string ?? "";
+    string environmentOut   = pEnvironment.Value as string ?? "";
+    string errorText        = pErrorText.Value as string ?? "";
 
-        public ExcelObjects(ILogger? logger = null)
-        {
-            _logger = logger;
-        }
-
-        /// <summary>Start Excel (no UI, macros disabled).</summary>
-        public async Task InitializeAsync()
-        {
-            TryLog("Starting Excel...");
-            await Task.Yield();
-
-            // Start Excel
-            _excel = new Excel.Application
-            {
-                Visible = false,
-                DisplayAlerts = false
-            };
-
-            // Disable macro automation security (no prompts)
-            try
-            {
-                Excel.AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityForceDisable;
-            }
-            catch { /* not fatal on some installs */ }
-
-            // sanity
-            if (_excel == null)
-                throw new InvalidOperationException("Failed to create Excel.Application.");
-        }
-
-        /// <summary>Open a workbook.</summary>
-        public void OpenWorkbook(string filename, bool readOnly = true)
-        {
-            if (string.IsNullOrWhiteSpace(filename))
-                throw new ArgumentException("Filename cannot be null or empty.", nameof(filename));
-
-            if (!System.IO.File.Exists(filename))
-                throw new System.IO.FileNotFoundException($"Excel file not found at path: {filename}", filename);
-
-            if (_excel is null)
-                throw new InvalidOperationException("Excel application is not initialized. Call InitializeAsync() first.");
-
-            TryLog($"Opening Excel workbook: {filename} (ReadOnly={readOnly})");
-
-            // Named args avoid the large parameter list on COM method
-            _workBook = _excel.Workbooks.Open(
-                Filename: filename,
-                ReadOnly: readOnly
-            );
-        }
-
-        /// <summary>Save the active workbook (same format).</summary>
-        public void Save()
-        {
-            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
-            TryLog("Saving workbook...");
-            _workBook.Save();
-        }
-
-        /// <summary>Save As a new path (same format).</summary>
-        public void SaveAs(string filename)
-        {
-            if (string.IsNullOrWhiteSpace(filename))
-                throw new ArgumentException("Filename cannot be null or empty.", nameof(filename));
-            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
-
-            TryLog($"Saving workbook as: {filename}");
-            _workBook.SaveAs(Filename: filename);
-        }
-
-        /// <summary>Export as plain text (*.txt, tab-delimited).</summary>
-        public void SaveAsText(string filename)
-        {
-            if (string.IsNullOrWhiteSpace(filename))
-                throw new ArgumentException("Filename cannot be null or empty.", nameof(filename));
-            if (_workBook is null) throw new InvalidOperationException("No workbook is open.");
-
-            TryLog($"Exporting workbook to text: {filename}");
-
-            _workBook.SaveAs(
-                Filename: filename,
-                FileFormat: Excel.XlFileFormat.xlTextWindows,
-                AccessMode: Excel.XlSaveAsAccessMode.xlNoChange
-            );
-        }
-
-        /// <summary>Close the workbook (without saving changes).</summary>
-        public void CloseWorkbook()
-        {
-            TryLog("Closing workbook...");
-            try { _workBook?.Close(SaveChanges: false); }
-            finally { ReleaseCom(ref _workBook); }
-        }
-
-        /// <summary>Dispose Excel and release COM.</summary>
-        public void Dispose()
-        {
-            TryLog("Disposing Excel objects...");
-
-            try
-            {
-                // Close WB if still open
-                try { _workBook?.Close(SaveChanges: false); } catch { /* ignore */ }
-                ReleaseCom(ref _workBook);
-
-                // Quit Excel
-                try { _excel?.Quit(); } catch { /* ignore */ }
-                ReleaseCom(ref _excel);
-
-                // Encourage COM cleanup
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-            }
-            catch { /* best effort */ }
-        }
-
-        // -------- helpers --------
-
-        private void TryLog(string message)
-        {
-            if (!string.IsNullOrWhiteSpace(message))
-            {
-                if (_logger != null) _logger.LogInformation(message);
-                else Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
-            }
-        }
-
-        private static void ReleaseCom<T>(ref T? comObj) where T : class
-        {
-            if (comObj != null && Marshal.IsComObject(comObj))
-            {
-                try { Marshal.FinalReleaseComObject(comObj); }
-                catch { /* ignore */ }
-            }
-            comObj = null;
-        }
-    }
+    // ...use these as needed
 }
