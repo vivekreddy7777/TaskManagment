@@ -1,27 +1,26 @@
-// grabs POSIDX ranges into #POSIDX exactly like the SP (via OPENQUERY)
-private void PullPosnixRanges()
+// grabs CCRCDX ranges into #CCRCDX exactly like the SP (via OPENQUERY)
+private void PullCrcdxRanges()
 {
     const string create = @"
-IF OBJECT_ID('tempdb..#POSIDX') IS NOT NULL DROP TABLE #POSIDX;
-CREATE TABLE #POSIDX
+IF OBJECT_ID('tempdb..#CCRCDX') IS NOT NULL DROP TABLE #CCRCDX;
+CREATE TABLE #CCRCDX
 (
-    INX_DSP_PHCY_START VARCHAR(10),
-    INX_DSP_PHCY_END   VARCHAR(10),
-    TABLE_ID           VARCHAR(3),
-    PROCESSED          BIT DEFAULT 0
+    DCX_RVRSD_PTNT_AGN_START VARCHAR(11),
+    DCX_RVRSD_PTNT_AGN_END   VARCHAR(10),
+    TABLE_ID                 VARCHAR(3)
 );";
     using (var cmd = new SqlCommand(create, _sql)) cmd.ExecuteNonQuery();
 
     const string linkedServer = /* put your linked server name here */ "DB2_LINK";
 
     string insert = $@"
-INSERT INTO #POSIDX (INX_DSP_PHCY_START, INX_DSP_PHCY_END, TABLE_ID)
-SELECT LEFT(REPLACE(INX_DSP_PHCY_START, CHAR(0), ''), 10),
-       LEFT(INX_DSP_PHCY_END, 10),
-       LEFT(INX_TABLE_ID, 1)
+INSERT INTO #CCRCDX (DCX_RVRSD_PTNT_AGN_START, DCX_RVRSD_PTNT_AGN_END, TABLE_ID)
+SELECT DCX_RVRSD_PTNT_AGN_START,
+       DCX_RVRSD_PTNT_AGN_END,
+       LEFT(DCX_TABLE_ID, 1)
 FROM OPENQUERY({linkedServer},
-    'SELECT INX_DSP_PHCY_START, INX_DSP_PHCY_END, INX_TABLE_ID
-       FROM DB0.@RL+POS0.POSIDX00
+    'SELECT DCX_RVRSD_PTNT_AGN_START, DCX_RVRSD_PTNT_AGN_END, DCX_TABLE_ID
+       FROM DB0.@RL+CCRO.CCRCDX00
       FOR FETCH ONLY WITH UR')";
     using (var cmd = new SqlCommand(insert, _sql)) cmd.ExecuteNonQuery();
 }
