@@ -1,94 +1,161 @@
-private (List<string> ids, string csv) BuildEntityList(SqlConnection sql)
+private void MapDb2IdsIntoAddtnl1()
 {
-    const string getIdsSql = @"
-        SELECT TOP (150) MEMBER_ID
-        FROM #CLAIM_MEMBER_INFO
-        WHERE PROCESSED = 0
-        ORDER BY MEMBER_ID;";
+    var sqlText = $@"
+UPDATE t
+SET t.RVRSD_PNT_AGN = d.RVSVD_PINT_ACN
+FROM [{Db}].[tblCompareClaimsDetails_Addtnl_1_IDs] AS t
+JOIN #DB2_MEMBER_INFO d
+  ON d.MEMBER_ID  = t.MEMBER_ID
+ AND d.PERSON_NBR = t.PERSON_NBR
+WHERE t.[BulkInsertKey] = @key
+  AND t.[WM_ID]        = @wm;";
 
-    var ids = new List<string>();
-    using (var cmd = new SqlCommand(getIdsSql, sql))
-    using (var rdr = cmd.ExecuteReader())
-        while (rdr.Read())
-            ids.Add(rdr.GetString(0));
-
-    // mimic: SELECT STUFF((SELECT ',' + '''' + MEMBER_ID + '''' ...),1,1,'')
-    // -> "'A','B','C'"
-    var quoted = ids.Select(id => $"'{id.Replace("'", "''")}'");
-    var csv = string.Join(",", quoted);
-
-    Console.WriteLine($"[DEBUG] @EntityList: {csv}");
-    return (ids, csv);
+    using var cmd = new SqlCommand(sqlText, _sql);
+    cmd.Parameters.AddWithValue("@key", _bulkInsertKey);
+    cmd.Parameters.AddWithValue("@wm",  _wmId);
+    cmd.ExecuteNonQuery();
 }
 
-// 2) OPENQUERY equivalent against DB2 and INSERT into #DB2_MEMBER_INFO
-//    SP columns: MEMBERSHIP_NBR, PERSON_NBR, TRANS_INDIV_AGN_ID
-//    Target temp table: #DB2_MEMBER_INFO (MEMBER_ID, PERSON_NBR, RVRSD_PTNT_ACN)
-private void OpenQueryIntoDb2MemberInfo(SqlConnection sql, DB2Connection db2)
+--------------------------------------------
+private void InsertEntityRowsIntoLocalIds()
 {
-    // a) get the next 150 unprocessed MEMBER_IDs (as the SP does each loop)
-    var (ids, csv) = BuildEntityList(sql);
-    if (ids.Count == 0)
+    var sqlText = $@"
+INSERT INTO [{Db}].[tblCompareClaimsDetails_Addtnl_1_IDs]
+        ([WM_ID], [BulkInsertKey], [IM_CLAIM_ID], [RVRSD_PNT_AGN], [MEMBER_ID])
+SELECT  @wm,   @key,            [CLAIM_ID],     [RVRSD_PNT_AGN],  [MEMBER_ID]
+FROM   [{_tempTableName}] AS et;";
+
+    using var cmd = new SqlCommand(sqlText, _sql);
+    cmd.Parameters.AddWithValue("@key", _bulkInsertKey);
+    cmd.Parameters.AddWithValue("@wm",  _wmId);
+    cmd.ExecuteNonQuery();
+}
+--------------------------------------------
+private void LoadPosnixRanges()
+{
+    // a) local temp
+    const string create = @"
+IF OBJECT_ID('tempdb..#POSNIX') IS NOT NULL DROP TABLE #POSNIX;
+CREATE TABLE #POSNIX(
+    INX_DSP_PHCY_START varchar(10),
+    INX_DSP_PHCY_END   varchar(10),
+    TABLE_ID           varchar(1),
+    Processed          bit DEFAULT 0
+);";
+    using (var cmd = new SqlCommand(create, _sql)) cmd.ExecuteNonQuery();
+
+    // b) pull from DB2  (swap to your real DB2 table/view name)
+    const string db2Sql = @"
+SELECT
+    RTRIM(REPLACE(INX_DSP_PHCY_START, CHAR(0), '')) AS INX_DSP_PHCY_START,
+    RTRIM(REPLACE(INX_DSP_PHCY_END,   CHAR(0), '')) AS INX_DSP_PHCY_END,
+    LEFT(INX_TABLE_ID, 1)                            AS TABLE_ID
+FROM POS0.POSIDXDB
+WITH UR";
+
+    var rows = new DataTable();
+    using (var db2Cmd = _db2.CreateCommand())
     {
-        Console.WriteLine("[DEBUG] No unprocessed MEMBER_ID rows left.");
-        return;
+        db2Cmd.CommandText = db2Sql;
+        using var da = new DB2DataAdapter((DB2Command)db2Cmd);
+        da.Fill(rows);
     }
 
-    // b) Build a parameterized DB2 IN (...) rather than string-splicing
-    //    (DB2 .NET supports positional '?' parameters)
-    var placeholders = string.Join(",", Enumerable.Range(0, ids.Count).Select(_ => "?"));
+    // c) bulk to #POSNIX
+    using var bulk = new SqlBulkCopy(_sql) { DestinationTableName = "#POSNIX" };
+    bulk.ColumnMappings.Add("INX_DSP_PHCY_START", "INX_DSP_PHCY_START");
+    bulk.ColumnMappings.Add("INX_DSP_PHCY_END",   "INX_DSP_PHCY_END");
+    bulk.ColumnMappings.Add("TABLE_ID",           "TABLE_ID");
+    bulk.WriteToServer(rows);
+}
+------------------------------------------
+private void LoadCcrdxRanges()
+{
+    // a) local temp
+    const string create = @"
+IF OBJECT_ID('tempdb..#CCRDX') IS NOT NULL DROP TABLE #CCRDX;
+CREATE TABLE #CCRDX(
+    DCX_RVRSD_PNT_AGN_START varchar(11),
+    DCX_RVRSD_PNT_AGN_END   varchar(10),
+    TABLE_ID                varchar(1)
+);";
+    using (var cmd = new SqlCommand(create, _sql)) cmd.ExecuteNonQuery();
 
-    // IMPORTANT: swap in your real DB2 schema/table name used in the SP
-    var db2Sql = $@"
-        SELECT
-            MEMBERSHIP_NBR AS MEMBER_ID,
-            PERSON_NBR     AS PERSON_NBR,
-            TRANS_INDIV_AGN_ID AS RVRSD_PTNT_ACN
-        FROM ELGO.ELGSMK00               -- <== your DB2 object from the SP
-        WHERE MEMBERSHIP_NBR IN ({placeholders})
-        WITH UR";
+    // b) pull from DB2 (swap to your real CCR0/CCRDCX00 path)
+    const string db2Sql = @"
+SELECT
+    DCX_RVRSD_PNT_AGN_START,
+    DCX_RVRSD_PNT_AGN_END,
+    LEFT(DCX_TABLE_ID, 1) AS TABLE_ID
+FROM CCR0.CCRDCX00
+WITH UR";
 
-    using var db2Cmd = db2.CreateCommand();
-    db2Cmd.CommandText = db2Sql;
-
-    // add one DB2 parameter per id (positional)
-    foreach (var id in ids)
+    var rows = new DataTable();
+    using (var db2Cmd = _db2.CreateCommand())
     {
-        var p = db2Cmd.CreateParameter();
-        p.DB2Type = DB2Type.VarChar;
-        p.Value = id;
-        db2Cmd.Parameters.Add(p);
+        db2Cmd.CommandText = db2Sql;
+        using var da = new DB2DataAdapter((DB2Command)db2Cmd);
+        da.Fill(rows);
     }
 
-    // c) fetch from DB2
-    var db2Rows = new DataTable();
-    using (var da = new DB2DataAdapter((DB2Command)db2Cmd))
-        da.Fill(db2Rows);
+    // c) bulk to #CCRDX
+    using var bulk = new SqlBulkCopy(_sql) { DestinationTableName = "#CCRDX" };
+    bulk.ColumnMappings.Add("DCX_RVRSD_PNT_AGN_START", "DCX_RVRSD_PNT_AGN_START");
+    bulk.ColumnMappings.Add("DCX_RVRSD_PNT_AGN_END",   "DCX_RVRSD_PNT_AGN_END");
+    bulk.ColumnMappings.Add("TABLE_ID",                "TABLE_ID");
+    bulk.WriteToServer(rows);
+}
+-------------------------------------------
+private void UpdateAddtnl1FromEntityAndRanges()
+{
+    // (a) copy over simple fields from entity temp to Addtnl_1_IDs
+    var updateA = $@"
+UPDATE ID
+SET  ID.CompareCode   = ISNULL(ET.COMPARE_CODE, 'MARN')
+    ,ID.CLAIM_DOS     = ET.CLAIM_DOS
+    ,ID.PHARMACY_ID   = ET.PHARMACY_ID
+    ,ID.ClaimResponse = ET.ClaimResponse
+FROM [{Db}].[tblCompareClaimsDetails_Addtnl_1_IDs] ID
+JOIN [{_tempTableName}] ET
+  ON ID.IM_CLAIM_ID = ET.CLAIM_ID
+WHERE ID.[BulkInsertKey] = @key
+  AND ID.[WM_ID]        = @wm;";
 
-    // d) land into the SQL temp table exactly like: INSERT INTO #DB2_MEMBER_INFO (...) EXEC(@SQL_Final)
-    using (var bulk = new SqlBulkCopy(sql) { DestinationTableName = "#DB2_MEMBER_INFO" })
+    using (var cmd = new SqlCommand(updateA, _sql))
     {
-        bulk.ColumnMappings.Add("MEMBER_ID",       "MEMBER_ID");
-        bulk.ColumnMappings.Add("PERSON_NBR",      "PERSON_NBR");
-        bulk.ColumnMappings.Add("RVRSD_PTNT_ACN",  "RVSVD_PINT_ACN"); // matches your temp table column name
-        bulk.WriteToServer(db2Rows);
+        cmd.Parameters.AddWithValue("@key", _bulkInsertKey);
+        cmd.Parameters.AddWithValue("@wm",  _wmId);
+        cmd.ExecuteNonQuery();
     }
 
-    // e) mark those 150 as processed (SP sets PROCESSED = 1 for the same set)
-    if (ids.Count > 0)
-    {
-        var sb = new StringBuilder();
-        var prms = new List<SqlParameter>();
-        for (int i = 0; i < ids.Count; i++)
-        {
-            if (i > 0) sb.Append(",");
-            sb.Append($"@m{i}");
-            prms.Add(new SqlParameter($"@m{i}", ids[i]));
-        }
+    // (b) set POS_DB and CCR_DB from the temp range tables
+    var updateB = $@"
+UPDATE T
+SET POS_DB =
+(
+    SELECT TOP 1 P.TABLE_ID
+    FROM #POSNIX P
+    WHERE TRY_CAST(T.PHARMACY_ID AS bigint) BETWEEN
+          TRY_CAST(P.INX_DSP_PHCY_START AS bigint)
+      AND TRY_CAST(P.INX_DSP_PHCY_END   AS bigint)
+),
+CCR_DB =
+(
+    SELECT TOP 1 C.TABLE_ID
+    FROM #CCRDX C
+    WHERE TRY_CAST(T.RVRSD_PNT_AGN AS bigint) BETWEEN
+          TRY_CAST(C.DCX_RVRSD_PNT_AGN_START AS bigint)
+      AND TRY_CAST(C.DCX_RVRSD_PNT_AGN_END   AS bigint)
+)
+FROM [{Db}].[tblCompareClaimsDetails_Addtnl_1_IDs] T
+WHERE T.[BulkInsertKey] = @key
+  AND T.[WM_ID]        = @wm
+  AND TRY_CONVERT(datetime, T.CLAIM_DOS, 121) > '1900-01-01';";
 
-        var markSql = $"UPDATE #CLAIM_MEMBER_INFO SET PROCESSED = 1 WHERE MEMBER_ID IN ({sb});";
-        using var markCmd = new SqlCommand(markSql, sql);
-        markCmd.Parameters.AddRange(prms.ToArray());
-        markCmd.ExecuteNonQuery();
+    using (var cmd = new SqlCommand(updateB, _sql))
+    {
+        cmd.Parameters.AddWithValue("@key", _bulkInsertKey);
+        cmd.Parameters.AddWithValue("@wm",  _wmId);
+        cmd.ExecuteNonQuery();
     }
 }
