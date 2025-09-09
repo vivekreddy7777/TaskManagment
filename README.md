@@ -1,20 +1,19 @@
+BEGIN TRY
+    IF @Debug=1 PRINT CONCAT('[',@ThisProc,'][',@RunId,'][STEP=Validation_BulkInsert] start');
+    EXEC dbo.procCompareTool_Validation_BulkInsert
+         @Password=@Password,
+         @TableName=@ValTableName,
+         @TempTableName=@ValTempTableName,
+         @FileName=@FileName,
+         @ProcResult=@ProcResult OUTPUT,
+         @Debug=@Debug;
+    IF @Debug=1 PRINT CONCAT('[',@ThisProc,'][',@RunId,'][STEP=Validation_BulkInsert] done: ', @ProcResult);
+END TRY
 BEGIN CATCH
-    DECLARE @ThisProc SYSNAME = QUOTENAME(OBJECT_SCHEMA_NAME(@@PROCID)) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID));
-    DECLARE @RunId UNIQUEIDENTIFIER = NEWID();
-
-    DECLARE @ErrMsg NVARCHAR(MAX) = CONCAT(
-        '[ORIGIN=', @ThisProc, '][RUNID=', @RunId, '] ',
-        'Table=', ISNULL(@TempTableName,'(null)'), 
-        ' | Error=', ERROR_NUMBER(),
-        ', Sev=', ERROR_SEVERITY(),
-        ', State=', ERROR_STATE(),
-        ', Line=', ERROR_LINE(),
-        ' | ', ERROR_MESSAGE()
-    );
-
-    SET @ProcResult = @ErrMsg;
-
-    IF @Debug = 1 PRINT @ErrMsg;
-
-    THROW 51010, @ErrMsg, 1;
-END CATCH
+    -- bubble with a precise tag so you know *which* child failed
+    THROW 51010, CONCAT(
+        '[ORIGIN=',@ThisProc,'][RUNID=',@RunId,'][STEP=Validation_BulkInsert] ',
+        'Err=',ERROR_NUMBER(),', Sev=',ERROR_SEVERITY(),', State=',ERROR_STATE(),
+        ', Line=',ERROR_LINE(),' | ',ERROR_MESSAGE()
+    ), 1;
+END CATCH;
