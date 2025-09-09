@@ -1,26 +1,27 @@
-internal static class Db2Bootstrap
-{
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetDefaultDllDirectories(int flags);
+BEGIN CATCH
+    DECLARE 
+        @ErrNum int        = ERROR_NUMBER(),
+        @ErrSev int        = ERROR_SEVERITY(),
+        @ErrState int      = ERROR_STATE(),
+        @ErrLine int       = ERROR_LINE(),
+        @ErrProc nvarchar(200) = ERROR_PROCEDURE(),
+        @ErrMsg nvarchar(max)  = ERROR_MESSAGE();
 
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern IntPtr AddDllDirectory(string path);
+    SET @ProcResult = CONCAT(
+        'Validation: File Upload Error. ',
+        'File: ', @FileName,
+        ' | Table: ', @TempTableName,
+        ' | Error ', @ErrNum,
+        ', Severity ', @ErrSev,
+        ', State ', @ErrState,
+        ', Line ', @ErrLine,
+        CASE WHEN @ErrProc IS NOT NULL THEN CONCAT(', Proc ', @ErrProc) ELSE '' END,
+        '. Msg: ', @ErrMsg
+    );
 
-    private const int LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
-
-    public static void Init()
-    {
-        var db2Dir = Path.Combine(AppContext.BaseDirectory, "clidriver", "bin");
-        if (!Directory.Exists(db2Dir))
-            throw new DirectoryNotFoundException(db2Dir);
-
-        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        AddDllDirectory(db2Dir);
-
-        Environment.SetEnvironmentVariable("DB2PATH", db2Dir);
-        Environment.SetEnvironmentVariable("PATH", db2Dir + ";" + Environment.GetEnvironmentVariable("PATH"));
-    }
-}
-
-// In Program.cs:
-Db2Bootstrap.Init(); 
+    IF @Debug = 1
+    BEGIN
+        PRINT @ProcResult;
+        PRINT 'Command was: ' + @cmd;
+    END
+END CATCH
