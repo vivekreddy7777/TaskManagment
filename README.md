@@ -1,19 +1,16 @@
-BEGIN TRY
-    IF @Debug=1 PRINT CONCAT('[',@ThisProc,'][',@RunId,'][STEP=Validation_BulkInsert] start');
-    EXEC dbo.procCompareTool_Validation_BulkInsert
-         @Password=@Password,
-         @TableName=@ValTableName,
-         @TempTableName=@ValTempTableName,
-         @FileName=@FileName,
-         @ProcResult=@ProcResult OUTPUT,
-         @Debug=@Debug;
-    IF @Debug=1 PRINT CONCAT('[',@ThisProc,'][',@RunId,'][STEP=Validation_BulkInsert] done: ', @ProcResult);
-END TRY
-BEGIN CATCH
-    -- bubble with a precise tag so you know *which* child failed
-    THROW 51010, CONCAT(
-        '[ORIGIN=',@ThisProc,'][RUNID=',@RunId,'][STEP=Validation_BulkInsert] ',
-        'Err=',ERROR_NUMBER(),', Sev=',ERROR_SEVERITY(),', State=',ERROR_STATE(),
-        ', Line=',ERROR_LINE(),' | ',ERROR_MESSAGE()
-    ), 1;
-END CATCH;
+SELECT
+  LWR.OPERATIONAL_ID                  AS CLAIM_GROUP,   -- LWR
+  CAR.OPERATIONAL_ID                  AS CBM_BPL        -- CAR
+FROM {schema}.CBMCLT00 CAR
+INNER JOIN {schema}.CBMCPO00  CMP   ON CAR.CLIENT_AGN = CMP.ACSTR_CLNT_AGN_ID
+INNER JOIN {schema}.CBMCLT00  LWR   ON LWR.CLIENT_AGN = CMP.CLIENT_AGN_ID
+WHERE
+  CAR.ROW_DEL_TMS = '2999-12-31-00.00.00.000000'
+  AND LWR.ROW_DEL_TMS = '2999-12-31-00.00.00.000000'
+  AND LWR.OPERATIONAL_ID IN ({inList})            -- @EntityList
+  AND LWR.CLIENT_TYPE_SEQ = 60                    -- group level
+  AND (CAR.CLIENT_TYPE_CDE = 'WB' OR CAR.CLIENT_TYPE_CDE = 'BT')
+WITH UR
+";
+
+    
