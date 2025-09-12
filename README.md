@@ -1,122 +1,135 @@
-public async Task ExportResults()
+
+public async Task ExportResults(CancellationToken ct = default)
 {
     _logger.LogInformation("ExportResults started");
+    using var scope = _scopeFactory.CreateScope();
+    var dbContext = scope.ServiceProvider.GetRequiredService<DBServerContext>();
+
+    // Reuse EF connection
+    var conn = dbContext.Database.GetDbConnection();
+    var mustOpen = conn.State != ConnectionState.Open;
+    if (mustOpen) await conn.OpenAsync(ct);
 
     try
     {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<DBServerContext>();
-        LogStatus("Call Export Service");
-
-        // Keep a human-readable summary of what we executed for audit/logging
-        string executedInnerProc;
         string reportName;
+        string innerProcName;
 
-        using (var conn = new SqlConnection(Constants.ConnectionString))
+        // -------------------------------
+        // 1) INNER PROC (Errors/Alternate)
+        // -------------------------------
+        var swInner = Stopwatch.StartNew();
+
+        using (var cmd = conn.CreateCommand())
         {
-            await conn.OpenAsync();
+            cmd.CommandType = CommandType.StoredProcedure;
 
-            // ------------------------------------------------------------
-            // 1) Execute the INNER export proc with parameters (no ExecSQL text)
-            // ------------------------------------------------------------
-            using (var cmd = conn.CreateCommand())
+            if (ValidationErrors)
             {
-                cmd.CommandType = CommandType.StoredProcedure;
+                reportName   = "CompareErrors";
+                innerProcName = "dbo.procCompareTool_ClaimExport_Errors";
+                cmd.CommandText = innerProcName;
 
-                if (ValidationErrors)
-                {
-                    reportName = "CompareErrors";
-                    cmd.CommandText = "dbo.procCompareTool_ClaimExport_Errors";
+                var pWm = cmd.CreateParameter();
+                pWm.ParameterName = "@WM_ID";
+                pWm.DbType = DbType.Int32;
+                pWm.Value = Compare_ID;
+                cmd.Parameters.Add(pWm);
 
-                    cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.Int) { Value = Compare_ID });
-                    cmd.Parameters.Add(new SqlParameter("@BulkInsertKey", SqlDbType.VarChar, 100)
-                    {
-                        Value = (object?)BulkInsertKey ?? DBNull.Value
-                    });
+                var pBulk = cmd.CreateParameter();
+                pBulk.ParameterName = "@BulkInsertKey";
+                pBulk.DbType = DbType.String;
+                pBulk.Value = (object?)BulkInsertKey ?? DBNull.Value;
+                cmd.Parameters.Add(pBulk);
 
-                    executedInnerProc = $"{cmd.CommandText} @WM_ID={Compare_ID}, @BulkInsertKey='{BulkInsertKey}'";
-                    _logger.LogDebug("Executing {Proc} with @WM_ID={WM_ID}, @BulkInsertKey={BulkInsertKey}",
-                        cmd.CommandText, Compare_ID, BulkInsertKey);
-                }
-                else
-                {
-                    reportName = "CompareAlternate";
-                    cmd.CommandText = "dbo.procCompareTool_ClaimExport_ALTERNATE";
+                _logger.LogDebug("{Proc} params: @WM_ID={WM}, @BulkInsertKey={Bulk}",
+                    innerProcName, Compare_ID, BulkInsertKey);
+            }
+            else
+            {
+                reportName   = "CompareAlternate";
+                innerProcName = "dbo.procCompareTool_ClaimExport_ALTERNATE";
+                cmd.CommandText = innerProcName;
 
-                    cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.Int) { Value = Compare_ID });
-                    cmd.Parameters.Add(new SqlParameter("@Type", SqlDbType.VarChar, 50)
-                    {
-                        Value = (object?)ExportRequestType ?? DBNull.Value
-                    });
+                var pWm = cmd.CreateParameter();
+                pWm.ParameterName = "@WM_ID";
+                pWm.DbType = DbType.Int32;
+                pWm.Value = Compare_ID;
+                cmd.Parameters.Add(pWm);
 
-                    executedInnerProc = $"{cmd.CommandText} @WM_ID={Compare_ID}, @Type='{ExportRequestType}'";
-                    _logger.LogDebug("Executing {Proc} with @WM_ID={WM_ID}, @Type={Type}",
-                        cmd.CommandText, Compare_ID, ExportRequestType);
-                }
+                var pType = cmd.CreateParameter();
+                pType.ParameterName = "@Type";
+                pType.DbType = DbType.String;
+                pType.Value = (object?)ExportRequestType ?? DBNull.Value;
+                cmd.Parameters.Add(pType);
 
-                var swInner = Stopwatch.StartNew();
-                await cmd.ExecuteNonQueryAsync();
-                swInner.Stop();
-                _logger.LogInformation("Inner export proc {Proc} completed in {Ms} ms.",
-                    cmd.CommandText, swInner.ElapsedMilliseconds);
+                _logger.LogDebug("{Proc} params: @WM_ID={WM}, @Type={Type}",
+                    innerProcName, Compare_ID, ExportRequestType);
             }
 
-            // ------------------------------------------------------------
-            // 2) Log/queue the export via the OUTER proc (same order as screenshot)
-            //    Password, UserId, Report_Name, ExecOutput, PasswordProtect,
-            //    FileName_Attr, ExecSQL, DataSource, ProcResult (OUTPUT)
-            // ------------------------------------------------------------
-            using (var cmdLog = conn.CreateCommand())
-            {
-                cmdLog.CommandType = CommandType.StoredProcedure;
-                cmdLog.CommandText = "dbo.procBTE_Export_MainRequest_INSERT";
-
-                // helper to add and debug-log
-                void Add(string name, SqlDbType type, object? value, int size = 0, ParameterDirection dir = ParameterDirection.Input)
-                {
-                    var p = size > 0 ? new SqlParameter(name, type, size) : new SqlParameter(name, type);
-                    p.Direction = dir;
-                    p.Value = value ?? DBNull.Value;
-                    cmdLog.Parameters.Add(p);
-                    _logger.LogDebug("SP Param: {Name} = {Value} (Type={Type}, Dir={Dir})",
-                        name, p.Value, p.SqlDbType, p.Direction);
-                }
-
-                // SAME ORDER AS YOUR SCREENSHOT
-                Add("@Password",        SqlDbType.VarChar,  Constants.Password, 50);
-                Add("@UserId",          SqlDbType.Int,      RequestorID);
-                Add("@Report_Name",     SqlDbType.NVarChar, reportName, 100);
-                Add("@ExecOutput",      SqlDbType.Bit,      ExecOutput);
-                Add("@PasswordProtect", SqlDbType.Bit,      PasswordProtect);
-                Add("@FileName_Attr",   SqlDbType.NVarChar, FileNameAttr + "_" + Constants.CentralTime.ToString("yyyyMMddHmmssFFF"), 260);
-
-                // For auditing, store exactly what we executed above
-                Add("@ExecSQL",         SqlDbType.NVarChar, executedInnerProc, -1);
-                Add("@DataSource",      SqlDbType.VarChar,  QCoreDb, 50);
-
-                var procResult = new SqlParameter("@ProcResult", SqlDbType.Int)
-                {
-                    Direction = ParameterDirection.Output
-                };
-                cmdLog.Parameters.Add(procResult);
-
-                var swLog = Stopwatch.StartNew();
-                await cmdLog.ExecuteNonQueryAsync();
-                swLog.Stop();
-
-                _logger.LogInformation(
-                    "Logged export via {Proc} in {Ms} ms. ProcResult={Result}",
-                    cmdLog.CommandText, swLog.ElapsedMilliseconds, procResult.Value ?? -1);
-            }
+            await cmd.ExecuteNonQueryAsync(ct);
         }
 
-        // Continue original flow
+        swInner.Stop();
+        _logger.LogInformation("Inner export proc {Proc} completed in {Ms} ms.",
+            ValidationErrors ? "procCompareTool_ClaimExport_Errors" : "procCompareTool_ClaimExport_ALTERNATE",
+            swInner.ElapsedMilliseconds);
+
+        // For audit trail in the outer proc, store a readable summary of what ran
+        var executedSummary = ValidationErrors
+            ? $"EXEC dbo.procCompareTool_ClaimExport_Errors @WM_ID={Compare_ID}, @BulkInsertKey='{BulkInsertKey}'"
+            : $"EXEC dbo.procCompareTool_ClaimExport_ALTERNATE @WM_ID={Compare_ID}, @Type='{ExportRequestType}'";
+
+        // ----------------------------------------------------------
+        // 2) OUTER PROC: procBTE_Export_MainRequest_INSERT (same order)
+        // ----------------------------------------------------------
+        var swOuter = Stopwatch.StartNew();
+
+        using (var cmdLog = conn.CreateCommand())
+        {
+            cmdLog.CommandType = CommandType.StoredProcedure;
+            cmdLog.CommandText = "dbo.procBTE_Export_MainRequest_INSERT";
+
+            // helper to reduce boilerplate
+            IDbDataParameter Add(string name, DbType type, object? value, int size = 0, ParameterDirection dir = ParameterDirection.Input)
+            {
+                var p = cmdLog.CreateParameter();
+                p.ParameterName = name;
+                p.DbType = type;
+                p.Direction = dir;
+                if (size > 0 && p is System.Data.Common.DbParameter dp) dp.Size = size;
+                p.Value = value ?? DBNull.Value;
+                cmdLog.Parameters.Add(p);
+                _logger.LogDebug("LogProc Param {Name}={Value} ({Type}, {Dir})", name, p.Value, p.DbType, p.Direction);
+                return p;
+            }
+
+            // SAME ORDER AS YOUR SCREENSHOT:
+            Add("@Password",        DbType.String,  Constants.Password, 50);
+            Add("@UserId",          DbType.Int32,   RequestorID);
+            Add("@Report_Name",     DbType.String,  reportName, 100);
+            Add("@ExecOutput",      DbType.Boolean, ExecOutput);
+            Add("@PasswordProtect", DbType.Boolean, PasswordProtect);
+            Add("@FileName_Attr",   DbType.String,  FileNameAttr + "_" + Constants.CentralTime.ToString("yyyyMMddHmmssFFF"), 260);
+            Add("@ExecSQL",         DbType.String,  executedSummary, int.MaxValue); // for audit trail
+            Add("@DataSource",      DbType.String,  QCoreDb, 50);
+
+            var pOut = Add("@ProcResult", DbType.Int32, null, 0, ParameterDirection.Output);
+
+            await cmdLog.ExecuteNonQueryAsync(ct);
+
+            _logger.LogInformation("Outer proc {Proc} completed in {Ms} ms. ProcResult={Result}",
+                cmdLog.CommandText, swOuter.ElapsedMilliseconds, pOut.Value ?? -1);
+        }
+
+        swOuter.Stop();
+
+        // Continue with your flow
         Run();
     }
-    catch (SqlException sqlEx)
+    catch (SqlException ex)
     {
-        _logger.LogError(sqlEx, "SQL error in ExportResults. Number={Number}, Message={Message}",
-            sqlEx.Number, sqlEx.Message);
+        _logger.LogError(ex, "SQL error in ExportResults. Number={Number}, Message={Message}", ex.Number, ex.Message);
         throw;
     }
     catch (Exception ex)
@@ -126,6 +139,7 @@ public async Task ExportResults()
     }
     finally
     {
+        if (mustOpen) await conn.CloseAsync();
         _logger.LogInformation("ExportResults End");
     }
 }
