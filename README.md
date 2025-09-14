@@ -1,37 +1,49 @@
-cmd.CommandText = "dbo.procCompareTool_ClaimExport_ALTERNATE";
+using (var cmdLog = connection.CreateCommand())
+{
+    cmdLog.CommandType = CommandType.StoredProcedure;
+    cmdLog.CommandText = "dbo.procBTE_Export_MainRequest_INSERT";
 
-var pWm = cmd.CreateParameter();
-pWm.ParameterName = "@WM_ID";
-pWm.DbType = DbType.String;                 // SP expects varchar(max)
-pWm.Value = Compare_ID.ToString();
-cmd.Parameters.Add(pWm);
+    DbParameter Add(string name, DbType type, object? value,
+        int size = 0, ParameterDirection dir = ParameterDirection.Input)
+    {
+        var p = cmdLog.CreateParameter();
+        p.ParameterName = name;
+        p.DbType = type;
+        p.Direction = dir;
+        if (size > 0 && p is System.Data.Common.DbParameter dp) dp.Size = size;
+        p.Value = value ?? DBNull.Value;
+        cmdLog.Parameters.Add(p);
 
-var pType = cmd.CreateParameter();
-pType.ParameterName = "@Type";              // must match SP param name
-pType.DbType = DbType.String;
-pType.Value = string.IsNullOrWhiteSpace(ExportRequestType) ? "1" : ExportRequestType;
-cmd.Parameters.Add(pType);
+        _logger.LogDebug("Outer Param: {Name}={Value} ({Type}, {Dir})",
+            name, p.Value ?? "NULL", p.DbType, p.Direction);
 
-var p1 = cmd.CreateParameter();
-p1.ParameterName = "@Parm1";
-p1.DbType = DbType.String;
-p1.Value = DBNull.Value;                    // optional, defaults to NULL
-cmd.Parameters.Add(p1);
+        return p;
+    }
 
-var p2 = cmd.CreateParameter();
-p2.ParameterName = "@Parm2";
-p2.DbType = DbType.String;
-p2.Value = DBNull.Value;                    // optional, defaults to NULL
-cmd.Parameters.Add(p2);
+    // Required / input parameters
+    Add("@Password", DbType.String, Constants.Password, 20);
+    Add("@Debug", DbType.Boolean, false);
+    Add("@PrintSQL", DbType.Boolean, false);
+    Add("@UserId", DbType.String, RequestorID, 50);
+    Add("@Report_Name", DbType.String, reportName, 50);
+    Add("@ExcelOutput", DbType.Boolean, ExcelOutput);
+    Add("@PasswordProtect", DbType.Boolean, PasswordProtect);
+    Add("@ExcelTabName", DbType.String, "Output", 50);
+    Add("@FileName_Attr", DbType.String,
+        FileName_Attr + "_" + Constants.CentralTime.ToString("yyyyMMddHHmmssFFF"), 260);
+    Add("@ExecSQL", DbType.String, execSummary, int.MaxValue);
+    Add("@DataSource", DbType.String, _CoreDb, 50);
+    Add("@Priority", DbType.Int32, null);
+    Add("@RunDate", DbType.String, DateTime.Now.ToString("yyyy-MM-dd"), 30);
+    Add("@IsDLreportemail", DbType.Boolean, false);
+    Add("@ReportEmail", DbType.String, "", 260);
 
-foreach (DbParameter p in cmd.Parameters)
-    _logger.LogDebug("Inner Param: {Name}={Value} ({Type})",
-        p.ParameterName, p.Value ?? "NULL", p.DbType);
+    // Output parameters
+    var procResult = Add("@ProcResult", DbType.String, null, int.MaxValue, ParameterDirection.Output);
+    var requestNumber = Add("@Request_Number", DbType.Int64, null, 0, ParameterDirection.Output);
 
-await cmd.ExecuteNonQueryAsync(token);
+    await cmdLog.ExecuteNonQueryAsync(token);
 
-var summary = 
-    $"EXEC dbo.procCompareTool_ClaimExport_ALTERNATE " +
-    $"@WM_ID={Compare_ID}, @Type='{pType.Value}', @Parm1=NULL, @Parm2=NULL";
-
-return ("CompareAlternate", summary);
+    _logger.LogInformation("BTE Export Result: ProcResult={Proc}, Request_Number={Req}",
+        procResult.Value, requestNumber.Value);
+}
