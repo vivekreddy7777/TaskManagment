@@ -1,140 +1,122 @@
-using System;
-using System.Data;
-using System.Data.SqlClient;
-
-public void ExportResults()
+public async Task ExportResults(CancellationToken ct = default)
 {
     _logger.LogInformation("ExportResults started");
 
-    // 1) open QC connection for the inner export
-    using (var qconn = new SqlConnection(Constants.QCConnectionString))   // <-- QC DB
-    // 2) open Core connection for the outer logging insert
-    using (var conn  = new SqlConnection(Constants.ConnectionString))     // <-- Core/App DB
+    using var scope = _scopeFactory.CreateScope();
+
+    // Core DB (outer proc)
+    var dbContext = scope.ServiceProvider.GetRequiredService<DBServerContext>();
+    var conn = dbContext.Database.GetDbConnection();
+    if (conn.State != ConnectionState.Open)
+        await conn.OpenAsync(ct);
+
+    // QC DB (inner procs)
+    var qcdbContext = scope.ServiceProvider.GetRequiredService<QCDBServerContext>();
+    var qconn = qcdbContext.Database.GetDbConnection();
+    if (qconn.State != ConnectionState.Open)
+        await qconn.OpenAsync(ct);
+
+    try
     {
-        try
+        string reportName;
+        string execSummary;
+
+        // -------------------------
+        // Inner proc on QC DB
+        // -------------------------
+        using (var cmd = (SqlCommand)qconn.CreateCommand())
         {
-            qconn.Open();
-            conn.Open();
+            cmd.CommandType = CommandType.StoredProcedure;
 
-            string reportName;
-            string execSummary; // human-readable text for logging only
-
-            // -------------------------------
-            // INNER PROC on qconn (QC)
-            // -------------------------------
-            using (var cmd = new SqlCommand())
+            if (ValidationErrors)
             {
-                cmd.Connection  = qconn;
-                cmd.CommandType = CommandType.StoredProcedure;
+                reportName = "CompareErrors";
+                cmd.CommandText = "dbo.procCompareTool_ClaimExport_Errors";
 
-                if (ValidationErrors)
-                {
-                    reportName     = "CompareErrors";
-                    cmd.CommandText = "dbo.procCompareTool_ClaimExport_Errors";
+                cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.VarChar, 50)
+                { Value = (object)Compare_ID ?? DBNull.Value });
 
-                    // @WM_ID looks alphanumeric -> NVARCHAR
-                    cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.NVarChar, 50)
-                    { Value = (object)Compare_ID ?? DBNull.Value });
+                cmd.Parameters.Add(new SqlParameter("@BulkInsertKey", SqlDbType.VarChar, 100)
+                { Value = (object)BulkInsertKey ?? DBNull.Value });
 
-                    cmd.Parameters.Add(new SqlParameter("@BulkInsertKey", SqlDbType.NVarChar, 100)
-                    { Value = (object)BulkInsertKey ?? DBNull.Value });
+                await cmd.ExecuteNonQueryAsync(ct);
 
-                    _logger.LogDebug("QC exec {Proc}: @WM_ID={WM_ID}, @BulkInsertKey={BulkKey}",
-                        cmd.CommandText, Compare_ID, BulkInsertKey);
+                execSummary = $"EXEC dbo.procCompareTool_ClaimExport_Errors @WM_ID='{Compare_ID}', @BulkInsertKey='{BulkInsertKey}'";
+                _logger.LogInformation("QC inner proc executed: {Proc}", cmd.CommandText);
+            }
+            else
+            {
+                reportName = "CompareAlternate";
+                cmd.CommandText = "dbo.procCompareTool_ClaimExport_ALTERNATE";
 
-                    cmd.ExecuteNonQuery();
+                cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.VarChar, 50)
+                { Value = (object)Compare_ID ?? DBNull.Value });
 
-                    execSummary = string.Format(
-                        "EXEC dbo.procCompareTool_ClaimExport_Errors @WM_ID='{0}', @BulkInsertKey='{1}'",
-                        Compare_ID, BulkInsertKey);
-                }
-                else
-                {
-                    reportName     = "CompareAlternate";
-                    cmd.CommandText = "dbo.procCompareTool_ClaimExport_ALTERNATE";
+                cmd.Parameters.Add(new SqlParameter("@Type", SqlDbType.VarChar, 50)
+                { Value = (object)ExportRequestType ?? DBNull.Value });
 
-                    cmd.Parameters.Add(new SqlParameter("@WM_ID", SqlDbType.NVarChar, 50)
-                    { Value = (object)Compare_ID ?? DBNull.Value });
+                await cmd.ExecuteNonQueryAsync(ct);
 
-                    cmd.Parameters.Add(new SqlParameter("@Type", SqlDbType.NVarChar, 50)
-                    { Value = (object)ExportRequestType ?? DBNull.Value });
-
-                    _logger.LogDebug("QC exec {Proc}: @WM_ID={WM_ID}, @Type={Type}",
-                        cmd.CommandText, Compare_ID, ExportRequestType);
-
-                    cmd.ExecuteNonQuery();
-
-                    execSummary = string.Format(
-                        "EXEC dbo.procCompareTool_ClaimExport_ALTERNATE @WM_ID='{0}', @Type='{1}'",
-                        Compare_ID, ExportRequestType);
-                }
-
-                _logger.LogInformation("Inner export (QC) succeeded. Report={Report}", reportName);
-
-                // -------------------------------
-                // OUTER PROC on conn (Core/App)
-                // -------------------------------
-                using (var cmdLog = new SqlCommand("dbo.procBTE_Export_MainRequest_INSERT", conn))
-                {
-                    cmdLog.CommandType = CommandType.StoredProcedure;
-
-                    // keep parameter order same as your original code/screenshots
-                    cmdLog.Parameters.Add(new SqlParameter("@Password", SqlDbType.VarChar, 50)
-                    { Value = (object)Constants.Password ?? DBNull.Value });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@UserId", SqlDbType.Int)
-                    { Value = RequestorID });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@Report_Name", SqlDbType.NVarChar, 100)
-                    { Value = (object)reportName ?? DBNull.Value });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@ExecOutput", SqlDbType.Bit)
-                    { Value = ExecOutput });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@PasswordProtect", SqlDbType.Bit)
-                    { Value = PasswordProtect });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@FileName_Attr", SqlDbType.NVarChar, 260)
-                    { Value = (object)(FileNameAttr + "_" + Constants.CentralTime.ToString("yyyyMMddHmmssFFF")) ?? DBNull.Value });
-
-                    // store the readable inner call text for auditing
-                    cmdLog.Parameters.Add(new SqlParameter("@ExecSQL", SqlDbType.NVarChar, -1)
-                    { Value = (object)execSummary ?? DBNull.Value });
-
-                    cmdLog.Parameters.Add(new SqlParameter("@DataSource", SqlDbType.VarChar, 50)
-                    { Value = (object)QCoreDb ?? DBNull.Value });
-
-                    var outParam = new SqlParameter("@ProcResult", SqlDbType.Int)
-                    { Direction = ParameterDirection.Output };
-                    cmdLog.Parameters.Add(outParam);
-
-                    foreach (SqlParameter p in cmdLog.Parameters)
-                        _logger.LogDebug("Core param {Name}={Value} (Type={Type}, Dir={Dir})",
-                            p.ParameterName, p.Value ?? "NULL", p.SqlDbType, p.Direction);
-
-                    cmdLog.ExecuteNonQuery();
-
-                    _logger.LogInformation("Logged export via procBTE_Export_MainRequest_INSERT. ProcResult={Result}",
-                        outParam.Value ?? -1);
-                }
+                execSummary = $"EXEC dbo.procCompareTool_ClaimExport_ALTERNATE @WM_ID='{Compare_ID}', @Type='{ExportRequestType}'";
+                _logger.LogInformation("QC inner proc executed: {Proc}", cmd.CommandText);
             }
         }
-        catch (SqlException ex)
+
+        // -------------------------
+        // Outer proc on Core DB
+        // -------------------------
+        using (var cmdLog = (SqlCommand)conn.CreateCommand())
         {
-            _logger.LogError(ex, "SQL error in ExportResults. Number={Number}, Message={Message}",
-                ex.Number, ex.Message);
-            throw;
+            cmdLog.CommandType = CommandType.StoredProcedure;
+            cmdLog.CommandText = "dbo.procBTE_Export_MainRequest_INSERT";
+
+            cmdLog.Parameters.Add(new SqlParameter("@Password", SqlDbType.VarChar, 50)
+            { Value = (object)Constants.Password ?? DBNull.Value });
+
+            cmdLog.Parameters.Add(new SqlParameter("@UserId", SqlDbType.Int)
+            { Value = RequestorID });
+
+            cmdLog.Parameters.Add(new SqlParameter("@Report_Name", SqlDbType.VarChar, 100)
+            { Value = (object)reportName ?? DBNull.Value });
+
+            cmdLog.Parameters.Add(new SqlParameter("@ExecOutput", SqlDbType.Bit)
+            { Value = ExecOutput });
+
+            cmdLog.Parameters.Add(new SqlParameter("@PasswordProtect", SqlDbType.Bit)
+            { Value = PasswordProtect });
+
+            cmdLog.Parameters.Add(new SqlParameter("@FileName_Attr", SqlDbType.VarChar, 260)
+            { Value = (object)(FileNameAttr + "_" + Constants.CentralTime.ToString("yyyyMMddHmmssFFF")) ?? DBNull.Value });
+
+            cmdLog.Parameters.Add(new SqlParameter("@ExecSQL", SqlDbType.VarChar, -1) // -1 = VARCHAR(MAX)
+            { Value = (object)execSummary ?? DBNull.Value });
+
+            cmdLog.Parameters.Add(new SqlParameter("@DataSource", SqlDbType.VarChar, 50)
+            { Value = (object)QCoreDb ?? DBNull.Value });
+
+            var outParam = new SqlParameter("@ProcResult", SqlDbType.Int)
+            { Direction = ParameterDirection.Output };
+            cmdLog.Parameters.Add(outParam);
+
+            await cmdLog.ExecuteNonQueryAsync(ct);
+
+            _logger.LogInformation("Core outer proc executed. ProcResult={Result}", outParam.Value ?? -1);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error in ExportResults: {Message}", ex.Message);
-            throw;
-        }
-        finally
-        {
-            if (qconn.State == ConnectionState.Open) qconn.Close();
-            if (conn.State  == ConnectionState.Open) conn.Close();
-            _logger.LogInformation("ExportResults End");
-        }
+    }
+    catch (SqlException ex)
+    {
+        _logger.LogError(ex, "SQL error in ExportResults. Number={Number}, Message={Message}", ex.Number, ex.Message);
+        throw;
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Unexpected error in ExportResults: {Message}", ex.Message);
+        throw;
+    }
+    finally
+    {
+        if (qconn.State == ConnectionState.Open) await qconn.CloseAsync();
+        if (conn.State == ConnectionState.Open) await conn.CloseAsync();
+        _logger.LogInformation("ExportResults End");
     }
 }
