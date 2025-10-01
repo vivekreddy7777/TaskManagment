@@ -1,70 +1,31 @@
-Overview
-
-Right now, the CompareTool service is doing both listening and execution. The service listens for jobs, loads job details, reads system variables, processes input files, calls stored procedures, handles DB2 fetch, applies rules, and finally exports results. This design puts too much inside the service. It limits scaling because the service has to do everything end to end.
-
-The new design moves all heavy execution into the Console. The Service will only listen for jobs and enqueue them. The Console will take the job and run the full pipeline. This separation gives us scaling flexibility, better error handling, and makes the system easier to monitor.
-
-⸻
-
-High Level Flow
-	1.	UI/API Upload – User uploads input file, job entry is created in SQL.
-	2.	Service Listener – Picks up the request, enqueues into WorkQueue, marks job as pending.
-	3.	Console Worker – Console picks up job from queue and runs the full execution:
-	•	Initialize (config, variables, working folder)
-	•	Load job details from SQL
-	•	Load input file into staging
-	•	Call DB2 and merge results
-	•	Run SQL rules and validations
-	•	Export results (Excel/TSV)
-	•	Mark job completed or failed
- UI/API Upload
-       │
-       ▼
- ┌─────────────┐
- │   Service   │  (Enqueue only)
- └─────────────┘
-       │
-       ▼
- ┌──────────────────────────┐
- │         Console          │
- │  - Initialize Config     │
- │  - Get Job Details       │
- │  - Load Input File       │
- │  - DB2 Fetch & Merge     │
- │  - Run Rules/Validations │
- │  - Export Results        │
- │  - Mark Completion       │
- └──────────────────────────┘
-Data
-	•	JobHeader: Keeps metadata like JobId, FileName, CompareType, Status.
-	•	WorkQueue: Tracks job execution (pending, running, completed, failed).
-	•	Staging Tables: Temporary area for input file data.
-	•	Result Tables: Store processed data and QC results.
-	•	Logs: Step by step execution details, errors, row counts.
-
-⸻
-
-Error Handling
-	•	Transient errors (e.g., DB2 timeout) → retry logic.
-	•	Permanent errors (e.g., bad file format) → fail fast, mark job as error.
-	•	Poison jobs (too many retries) → stopped and flagged.
-	•	Logs capture job id, step, duration, and error details.
-
-⸻
-
-Scaling
-	•	Service stays thin. Only needs 1–2 replicas.
-	•	Console can be scaled out. Each worker handles one job at a time. Add more workers = more throughput.
-	•	Database (SQL Server) remains central for staging, results, and rules.
-
-Testing
-	•	Testing is manual.
-	•	Jobs will be run with sample input files covering different compare types.
-	•	Output Excel/TSV will be validated against expected results.
-	•	Manual checks include row counts, DB2 merge correctness, rule validations, and export formatting.
-	•	Error scenarios (invalid file, missing columns, DB2 failure) will also be manually tested.
-
-Conclusion
-
-By moving all job execution into the Console, we decouple listening from processing. The Service stays light, and the Console becomes the execution engine. This lets us scale horizontally without changing business logic, and makes CompareTool more reliable under higher loads.
- 
+Date,Phase,Task
+2025-10-01,Development + Dev Testing,Set up Console structure & configs
+2025-10-02,Development + Dev Testing,Move initialization (system variables, folders) from Service → Console
+2025-10-03,Development + Dev Testing,Refactor job hydration (GetJobDetails)
+2025-10-06,Development + Dev Testing,Validate config + job hydration in Console
+2025-10-07,Development + Dev Testing,Unit test init + job hydration
+2025-10-08,Development + Dev Testing,Implement file load (CSV/XLSX → staging)
+2025-10-09,Development + Dev Testing,Validate staging schema and row counts
+2025-10-10,Development + Dev Testing,Dev test with sample input files
+2025-10-13,Development + Dev Testing,Add error handling for file load (bad/missing columns)
+2025-10-14,Development + Dev Testing,Regression test file load module
+2025-10-15,Development + Dev Testing,Move DB2 fetch logic into Console
+2025-10-16,Development + Dev Testing,Implement DB2 merge into staging
+2025-10-17,Development + Dev Testing,Dev test DB2 query execution
+2025-10-20,Development + Dev Testing,Validate DB2 merge row counts
+2025-10-21,Development + Dev Testing,Add retry handling for DB2 failures
+2025-10-22,Development + Dev Testing,Move SQL rules/validations into Console
+2025-10-23,Development + Dev Testing,Implement export logic (Excel/TSV naming conventions)
+2025-10-24,Development + Dev Testing,Run end-to-end test: staging → DB2 → rules → export
+2025-10-27,Development + Dev Testing,Debug issues and refine logging
+2025-10-28,Development + Dev Testing,Finalize Dev + Dev Testing; prepare QA handover
+2025-10-29,QA Testing + Bug Fixes,QA test with small input files
+2025-10-30,QA Testing + Bug Fixes,QA regression check export formatting
+2025-10-31,QA Testing + Bug Fixes,QA validate DB2 merges with expected counts
+2025-11-03,QA Testing + Bug Fixes,QA test large input files (performance checks)
+2025-11-04,QA Testing + Bug Fixes,QA edge case testing (invalid columns, missing metadata)
+2025-11-05,QA Testing + Bug Fixes,Triage QA defects and log bug list
+2025-11-06,QA Testing + Bug Fixes,Fix defects (file load + DB2 queries)
+2025-11-07,QA Testing + Bug Fixes,Retest fixed defects with targeted scenarios
+2025-11-10,QA Testing + Bug Fixes,Validate logs, metrics, dashboards
+2025-11-11,QA Testing + Bug Fixes,Final QA sign-off and project closure
