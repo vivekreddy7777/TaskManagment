@@ -1,156 +1,435 @@
-using System.Net.Http.Json;
-using BTA_CompareTool_Service;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
+using System.Data;
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Channels;
+using System.Xml;
+using System.Xml.XPath;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Hosting;
-using Serilog;
-using Serilog.Events;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Contrib.WaitAndRetry;
+using Polly.Retry;
 
-public static class Program
+namespace BTA_CompareTool_Service;
+
+// -------------------- Options --------------------
+public sealed class DatabaseOptions
 {
-    public static async Task Main(string[] args)
-    {
-        // --- Bootstrap Serilog early (before host) ---
-        Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Logs"));
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Information()
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-            .Enrich.FromLogContext()
-            .WriteTo.Console()
-            .WriteTo.File(Path.Combine(AppContext.BaseDirectory, "Logs", "service-boot.log"),
-                          rollingInterval: RollingInterval.Day, retainedFileCountLimit: 14)
-            .CreateLogger();
+    public string ConnectionString  { get; set; } = string.Empty;
+    public string Module            { get; set; } = "CompareTool";
+    public string UserId            { get; set; } = string.Empty;
+    public string Password          { get; set; } = string.Empty;
+    public int    CommandTimeoutSec { get; set; } = 60;
+    public int    ReceiveTimeoutSec { get; set; } = 10;
+}
 
+public sealed class ServiceOptions
+{
+    public int MaxThreads          { get; set; } = 4;    // SQL listeners
+    public int ChannelCapacity     { get; set; } = 200;  // in-memory buffer
+    public int ConsoleWriters      { get; set; } = 1;    // writer tasks (stdout) when ConsoleExePath is empty
+
+    // Retry
+    public int MaxTransientRetries { get; set; } = 8;
+    public int FirstBackoffMs      { get; set; } = 200;
+    public int MaxBackoffMs        { get; set; } = 8000;
+}
+
+public sealed class ConsoleOptions
+{
+    public string ConsoleExePath { get; set; } = string.Empty; // if empty => write to this process stdout
+    public string ConsoleArgs    { get; set; } = string.Empty;
+    public int    ProcessCount   { get; set; } = 0;            // 0 -> auto = Environment.ProcessorCount/2
+}
+
+// -------------------- Models --------------------
+public sealed record ReceivedMessage(long ReqId, string Xml);
+
+// -------------------- Hosted Service --------------------
+public sealed class CompareToolHostedService : BackgroundService
+{
+    private readonly ILogger<CompareToolHostedService> _log;
+    private readonly DatabaseOptions _db;
+    private readonly ServiceOptions _svc;
+    private readonly ConsoleOptions _console;
+
+    private string _module = string.Empty;
+    private string _queue  = string.Empty;
+    private int    _threads = 1;
+
+    private readonly Channel<ReceivedMessage> _outbox;
+    private AsyncRetryPolicy _sqlRetryPolicy = null!;
+
+    // console process pool (external workers)
+    private ConsoleProcess[] _procPool = Array.Empty<ConsoleProcess>();
+
+    public CompareToolHostedService(
+        ILogger<CompareToolHostedService> log,
+        IOptions<DatabaseOptions> db,
+        IOptions<ServiceOptions> svc,
+        IOptions<ConsoleOptions> console)
+    {
+        _log = log;
+        _db = db.Value;
+        _svc = svc.Value;
+        _console = console.Value;
+
+        _outbox = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions(Math.Max(50, _svc.ChannelCapacity))
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = false
+        });
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        BuildSqlRetryPolicy();
+        await _sqlRetryPolicy.ExecuteAsync(ct => LoadModuleAsync(ct), stoppingToken);
+
+        // Start console pool if configured
+        var useExternalConsoles = !string.IsNullOrWhiteSpace(_console.ConsoleExePath);
+        if (useExternalConsoles)
+            await StartConsolePoolAsync(stoppingToken);
+
+        // Writers: either multiple stdout writers OR a single dispatcher to the console pool
+        Task[] writerTasks;
+        if (useExternalConsoles)
+        {
+            writerTasks = new[] { Task.Run(() => ConsolePoolDispatcherAsync(stoppingToken), stoppingToken) };
+        }
+        else
+        {
+            var writerCount = Math.Max(1, _svc.ConsoleWriters);
+            writerTasks = Enumerable.Range(0, writerCount)
+                .Select(i => Task.Run(() => StdoutWriterAsync(i + 1, stoppingToken), stoppingToken))
+                .ToArray();
+        }
+
+        // SQL listeners
+        var listenerCount = Math.Clamp(_threads, 1, Math.Max(1, _svc.MaxThreads));
+        var listenerTasks = Enumerable.Range(0, listenerCount)
+            .Select(i => ListenerAsync(i + 1, stoppingToken))
+            .ToArray();
+
+        await Task.WhenAll(Task.WhenAll(listenerTasks), Task.WhenAll(writerTasks));
+
+        // teardown pool
+        if (_procPool.Length > 0)
+            await StopConsolePoolAsync();
+    }
+
+    // -------------------- Listener --------------------
+    private async Task ListenerAsync(int index, CancellationToken ct)
+    {
+        await using var conn = new SqlConnection(_db.ConnectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand("procBTE_ServiceBroker_Receive", conn)
+        {
+            CommandType = CommandType.StoredProcedure,
+            CommandTimeout = _db.CommandTimeoutSec
+        };
+        cmd.Parameters.AddWithValue("@Password", _db.Password);
+        cmd.Parameters.AddWithValue("@UserID",   _db.UserId);
+        cmd.Parameters.AddWithValue("@Queue",    _queue);
+        cmd.Parameters.AddWithValue("@Timeout",  _db.ReceiveTimeoutSec);
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var (reqId, xml) = await _sqlRetryPolicy.ExecuteAsync(c => ReceiveAsync(cmd, c), ct);
+                if (reqId is null || string.IsNullOrWhiteSpace(xml))
+                {
+                    await Task.Delay(100, ct);
+                    continue;
+                }
+
+                await _outbox.Writer.WriteAsync(new ReceivedMessage(reqId.Value, xml), ct);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Listener {Index} encountered a non-retriable error.", index);
+                await Task.Delay(500, ct);
+            }
+        }
+    }
+
+    // -------------------- Writer: STDOUT (in-proc scaling) --------------------
+    private async Task StdoutWriterAsync(int writerIndex, CancellationToken ct)
+    {
+        using var stdout = Console.OpenStandardOutput();
+        using var sw = new StreamWriter(stdout, new UTF8Encoding(false), bufferSize: 64 * 1024) { AutoFlush = true };
+
+        await foreach (var msg in _outbox.Reader.ReadAllAsync(ct))
+        {
+            try
+            {
+                var (v1, v2) = TryParseValues(msg.Xml);
+
+                var payload = new
+                {
+                    reqId  = msg.ReqId,
+                    module = _module,
+                    queue  = _queue,
+                    value1 = v1,
+                    value2 = v2,
+                    writer = writerIndex,
+                    xml    = msg.Xml
+                };
+
+                await sw.WriteLineAsync(JsonSerializer.Serialize(payload));
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "STDOUT writer {Index} failed for ReqId={ReqId}", writerIndex, msg.ReqId);
+            }
+        }
+    }
+
+    // -------------------- Writer: External Console Pool (multi-process scaling) --------------------
+    private async Task ConsolePoolDispatcherAsync(CancellationToken ct)
+    {
+        // partition by ReqId for stable ordering per partition
+        int Partition(long reqId) => (int)(reqId % _procPool.Length);
+
+        await foreach (var msg in _outbox.Reader.ReadAllAsync(ct))
+        {
+            try
+            {
+                var (v1, v2) = TryParseValues(msg.Xml);
+
+                var payload = new
+                {
+                    reqId  = msg.ReqId,
+                    module = _module,
+                    queue  = _queue,
+                    value1 = v1,
+                    value2 = v2,
+                    xml    = msg.Xml
+                };
+
+                var line = JsonSerializer.Serialize(payload);
+
+                var idx = Partition(msg.ReqId);
+                var proc = _procPool[idx];
+                await proc.SendAsync(line, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Dispatcher failed for ReqId={ReqId}", msg.ReqId);
+            }
+        }
+    }
+
+    // -------------------- SQL Helpers --------------------
+    private async Task<(long? ReqId, string? Xml)> ReceiveAsync(SqlCommand cmd, CancellationToken ct)
+    {
+        await using var rd = await cmd.ExecuteReaderAsync(ct);
+        if (!await rd.ReadAsync(ct)) return (null, null);
+
+        var body = rd["MessageBody"] as string ?? rd["message_body"] as string;
+        if (string.IsNullOrWhiteSpace(body)) return (null, null);
+
+        var id = TryParseRequestNumber(body);
+        return (id, body);
+    }
+
+    private async Task LoadModuleAsync(CancellationToken ct)
+    {
+        await using var conn = new SqlConnection(_db.ConnectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand("procBTE_System_Module_SELECT", conn)
+        {
+            CommandType = CommandType.StoredProcedure,
+            CommandTimeout = _db.CommandTimeoutSec
+        };
+        cmd.Parameters.AddWithValue("@Password", _db.Password);
+        cmd.Parameters.AddWithValue("@UserID",   _db.UserId);
+        cmd.Parameters.AddWithValue("@Module",   _db.Module);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct))
+            throw new InvalidOperationException($"Module not found: {_db.Module}");
+
+        _module  = _db.Module;
+        _queue   = r["QueueName"]?.ToString() ?? throw new InvalidOperationException("QueueName missing.");
+        _threads = Math.Max(1, ParseInt(r["ThreadCount"]));
+    }
+
+    // -------------------- XML Helpers --------------------
+    private static long? TryParseRequestNumber(string xml)
+    {
         try
         {
-            Log.Information("=== CompareTool service bootstrap ===");
-
-            // 1) base config: local JSON + env
-            var env = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "Production";
-            var baseCfg = new ConfigurationBuilder()
-                .SetBasePath(AppContext.BaseDirectory)
-                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                .AddJsonFile($"appsettings.{env}.json", optional: true, reloadOnChange: true)
-                .AddEnvironmentVariables()
-                .Build();
-
-            // 2) pull key/values from your config server (if configured)
-            var configServerUrl = baseCfg["ConfigServerPath"];
-            var serverValues = configServerUrl is { Length: > 0 }
-                ? await ConfigServerClient.FetchAsync(configServerUrl, Log.Logger)
-                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            if (serverValues.Count == 0 && !string.IsNullOrWhiteSpace(configServerUrl))
-                Log.Warning("Config server returned no values from {Url}", configServerUrl);
-
-            // (optional) push into legacy AppSettings for any old callers
-            foreach (var kv in serverValues)
-                System.Configuration.ConfigurationManager.AppSettings.Set(kv.Key, kv.Value);
-
-            // 3) FINAL merged configuration (server overrides JSON/env)
-            var mergedConfig = new ConfigurationBuilder()
-                .AddConfiguration(baseCfg)
-                .AddInMemoryCollection(serverValues) // last wins
-                .Build();
-
-            // 4) sanity check required connection string
-            var dbCs = mergedConfig.GetConnectionString("BTEBDConnectionString");
-            if (string.IsNullOrWhiteSpace(dbCs))
-                throw new InvalidOperationException("ConnectionStrings:BTEBDConnectionString missing.");
-
-            // 5) Build the worker host
-            var host = Host.CreateDefaultBuilder(args)
-                .UseWindowsService() // comment this out when running as console on Linux
-                .UseSerilog((ctx, cfg) =>
-                {
-                    cfg.ReadFrom.Configuration(mergedConfig)
-                       .Enrich.FromLogContext()
-                       .WriteTo.Console()
-                       .WriteTo.File(Path.Combine(AppContext.BaseDirectory, "Logs", "service.log"),
-                                     rollingInterval: RollingInterval.Day, retainedFileCountLimit: 14);
-
-                    if (!Environment.UserInteractive)
-                    {
-                        // requires Serilog.Sinks.EventLog package
-                        cfg.WriteTo.EventLog("BTA_CompareTool_Service", manageEventSource: true,
-                            restrictedToMinimumLevel: LogEventLevel.Error);
-                    }
-                })
-                .ConfigureServices(services =>
-                {
-                    // Typed options from CompareTool section
-                    services.AddOptions<CompareToolOptions>()
-                        .Bind(mergedConfig.GetSection("CompareTool"))
-                        .Configure<IConfiguration>((o, cfg) =>
-                        {
-                            // Connection string comes from standard ConnectionStrings section
-                            o.ConnectionString = cfg.GetConnectionString("BTEBDConnectionString") ?? string.Empty;
-                        })
-                        .Validate(o => !string.IsNullOrWhiteSpace(o.ConnectionString), "Connection string required.")
-                        .Validate(o => !string.IsNullOrWhiteSpace(o.Module), "Module required.")
-                        .ValidateOnStart();
-
-                    // Hosted service
-                    services.AddHostedService<CompareToolHostedService>();
-                })
-                .Build();
-
-            Log.Information("CompareTool service starting...");
-            await host.RunAsync();
+            using var sr = new StringReader(xml);
+            var xdoc = new XPathDocument(sr);
+            var nav  = xdoc.CreateNavigator();
+            var node = nav.SelectSingleNode("/message/Request_Number");
+            return node != null && long.TryParse(node.Value, out var id) ? id : null;
         }
-        catch (Exception ex)
+        catch (XmlException) { return null; }
+    }
+
+    private static (long?, long?) TryParseValues(string xml)
+    {
+        try
         {
-            Log.Fatal(ex, "Service failed to start.");
+            using var sr = new StringReader(xml);
+            var xdoc = new XPathDocument(sr);
+            var nav = xdoc.CreateNavigator();
+
+            var n1 = nav.SelectSingleNode("/message/Value1");
+            var n2 = nav.SelectSingleNode("/message/Value2");
+
+            long? v1 = long.TryParse(n1?.Value, out var a) ? a : null;
+            long? v2 = long.TryParse(n2?.Value, out var b) ? b : null;
+            return (v1, v2);
         }
-        finally
+        catch { return (null, null); }
+    }
+
+    // -------------------- Retry Policy --------------------
+    private void BuildSqlRetryPolicy()
+    {
+        var delays = Backoff.DecorrelatedJitterBackoffV2(
+            medianFirstRetryDelay: TimeSpan.FromMilliseconds(Math.Max(50, _svc.FirstBackoffMs)),
+            retryCount: Math.Max(1, _svc.MaxTransientRetries),
+            fastFirst: true);
+
+        if (_svc.MaxBackoffMs > 0)
+            delays = delays.Select(d => d > TimeSpan.FromMilliseconds(_svc.MaxBackoffMs)
+                ? TimeSpan.FromMilliseconds(_svc.MaxBackoffMs)
+                : d);
+
+        _sqlRetryPolicy = Policy
+            .Handle<SqlException>(IsTransient)
+            .WaitAndRetryAsync(
+                sleepDurations: delays,
+                onRetryAsync: async (ex, delay, attempt, ctx) =>
+                {
+                    _log.LogWarning(ex, "Transient SQL (attempt {Attempt}). Retrying in {Delay} ms.",
+                        attempt, (int)delay.TotalMilliseconds);
+                    await Task.CompletedTask;
+                });
+    }
+
+    private static bool IsTransient(SqlException ex) =>
+        ex.Number is -2 or 4060 or 40197 or 40501 or 40613 or 10928 or 10929 or 1205;
+
+    private static int ParseInt(object? v) => int.TryParse(v?.ToString(), out var n) ? n : 1;
+
+    // -------------------- External Console Process Pool --------------------
+    private async Task StartConsolePoolAsync(CancellationToken ct)
+    {
+        var count = _console.ProcessCount > 0 ? _console.ProcessCount : Math.Max(1, Environment.ProcessorCount / 2);
+        _procPool = new ConsoleProcess[count];
+
+        for (int i = 0; i < count; i++)
         {
-            Log.CloseAndFlush();
+            var p = new ConsoleProcess(_log, _console.ConsoleExePath, _console.ConsoleArgs, $"p{i+1}");
+            await p.StartAsync(ct);
+            _procPool[i] = p;
         }
+
+        _log.LogInformation("Console process pool started: {Count} process(es).", count);
+    }
+
+    private async Task StopConsolePoolAsync()
+    {
+        foreach (var p in _procPool)
+            await p.DisposeAsync();
+
+        _procPool = Array.Empty<ConsoleProcess>();
+        _log.LogInformation("Console process pool stopped.");
     }
 }
 
-/// <summary>
-/// Minimal client that reads your config server and returns a flat key/value dictionary.
-/// It accepts two common shapes:
-/// 1) { "key":"value", "key2":"value2" }
-/// 2) [ { "name":"key", "value":"value" }, ... ]
-/// </summary>
-internal static class ConfigServerClient
+// -------------------- External ConsoleProcess --------------------
+internal sealed class ConsoleProcess : IAsyncDisposable
 {
-    public static async Task<Dictionary<string, string>> FetchAsync(string url, ILogger logger)
+    private readonly ILogger _log;
+    private readonly string _exePath;
+    private readonly string _args;
+    private readonly string _name;
+
+    private Process? _proc;
+    private StreamWriter? _stdin;
+    private Task? _stdoutPump;
+    private Task? _stderrPump;
+
+    public ConsoleProcess(ILogger log, string exePath, string args, string name)
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-
-        try
-        {
-            using var resp = await http.GetAsync(url);
-            resp.EnsureSuccessStatusCode();
-
-            // Try map 1: simple dictionary
-            try
-            {
-                var dict = await resp.Content.ReadFromJsonAsync<Dictionary<string, string>>();
-                if (dict is { Count: > 0 })
-                    return new Dictionary<string, string>(dict, StringComparer.OrdinalIgnoreCase);
-            }
-            catch { /* fall through */ }
-
-            // Try map 2: array of { name, value }
-            var items = await resp.Content.ReadFromJsonAsync<List<NameValueItem>>();
-            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (items != null)
-                foreach (var i in items)
-                    if (!string.IsNullOrWhiteSpace(i.name))
-                        result[i.name] = i.value ?? string.Empty;
-
-            return result;
-        }
-        catch (Exception ex)
-        {
-            logger.Error(ex, "Failed to fetch config from {Url}", url);
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        }
+        _log = log;
+        _exePath = exePath;
+        _args = args ?? string.Empty;
+        _name = name;
     }
 
-    private sealed record NameValueItem(string name, string? value);
+    public async Task StartAsync(CancellationToken ct)
+    {
+        if (!File.Exists(_exePath))
+            throw new FileNotFoundException("Console exe not found", _exePath);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _exePath,
+            Arguments = _args,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        _proc.Start();
+
+        _stdin = new StreamWriter(_proc.StandardInput.BaseStream, new UTF8Encoding(false)) { AutoFlush = true };
+
+        _stdoutPump = Task.Run(async () =>
+        {
+            string? line;
+            while ((_proc is { HasExited: false }) && (line = await _proc.StandardOutput.ReadLineAsync()) is not null)
+                _log.LogInformation("[{Name}-out] {Line}", _name, line);
+        }, ct);
+
+        _stderrPump = Task.Run(async () =>
+        {
+            string? line;
+            while ((_proc is { HasExited: false }) && (line = await _proc.StandardError.ReadLineAsync()) is not null)
+                _log.LogWarning("[{Name}-err] {Line}", _name, line);
+        }, ct);
+    }
+
+    public Task SendAsync(string jsonLine, CancellationToken ct)
+    {
+        if (_stdin is null) throw new InvalidOperationException("Console process not started.");
+        return _stdin.WriteLineAsync(jsonLine).WaitAsync(ct);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            _stdin?.Dispose();
+            if (_proc is { HasExited: false })
+            {
+                try { _proc.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                _proc.WaitForExit(3000);
+            }
+            _proc?.Dispose();
+            if (_stdoutPump is not null) await _stdoutPump;
+            if (_stderrPump is not null) await _stderrPump;
+        }
+        catch { /* ignore */ }
+    }
 }
