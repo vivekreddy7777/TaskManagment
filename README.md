@@ -1,51 +1,87 @@
-using System;
-using System.Threading;
-using System.Threading.Tasks;
+using BTA_CompareTool_Console.Data;
+using BTA_CompareTool_Console.Services;
+using CompareTool.Models;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using BTA; // Make sure this matches your namespace (same as Job.cs / BTA_CompareTool_Job)
-using System.Text;
+using Microsoft.Extensions.Hosting;
+using Serilog;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
 
-namespace BTA_CompareTool_Console
+namespace CompareTool.ConsoleApp
 {
-    public class XmlConsumer
+    public static class Program
     {
-        private readonly ILogger<XmlConsumer> _log;
-        private readonly IServiceScopeFactory _scopeFactory;
-
-        public XmlConsumer(ILogger<XmlConsumer> log, IServiceScopeFactory scopeFactory)
+        public static async Task Main(string[] args)
         {
-            _log = log;
-            _scopeFactory = scopeFactory;
-        }
+            Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
-        // 👇 Your main method — this is called from Program.cs
-        public async Task ProcessXmlAsync(string xml, CancellationToken ct = default)
-        {
-            _log.LogInformation("Received XML payload from service: {xml}", xml);
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Information()
+                .WriteTo.Console()
+                .WriteTo.File(
+                    Path.Combine(AppContext.BaseDirectory, "Logs", "console-boot.log"),
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 14)
+                .CreateLogger();
 
-            // 1️⃣ Parse RequestNumber (optional)
-            long? requestNumber = null;
-            if (long.TryParse(xml, out var parsed))
-                requestNumber = parsed;
+            try
+            {
+                Log.Information("=== CompareTool Console Bootstrap ===");
 
-            // 2️⃣ Build Job just like the service
-            Job job = requestNumber.HasValue
-                ? new Job(requestNumber.Value, "CompareTool", "CompareClaimsDetails", "procCompareTool_Logic")
-                : new Job(xml, "CompareTool", "CompareClaimsDetails", "procCompareTool_Logic");
+                // Load base JSON config
+                var localConfig = new ConfigurationBuilder()
+                    .SetBasePath(AppContext.BaseDirectory)
+                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
 
-            // 3️⃣ Resolve BTA_CompareTool_Job from DI
-            using var scope = _scopeFactory.CreateScope();
-            var compareJob = ActivatorUtilities.CreateInstance<BTA_CompareTool_Job>(
-                scope.ServiceProvider, job);
+                string connectionString = localConfig.GetConnectionString("BTEDBConnectionString");
 
-            // 4️⃣ Run job pipeline
-            await compareJob.GetJobDetails(ct);
-            await compareJob.LoadInputFile(ct);
-            await compareJob.CallCompareTool(ct);
-            await compareJob.ExportResults(ct);
+                if (string.IsNullOrWhiteSpace(connectionString))
+                    throw new Exception("Connection string missing.");
 
-            _log.LogInformation("CompareTool console job completed successfully.");
+                Log.Information("DB Connection string found ✅");
+
+                // Host with service registration
+                var host = Host.CreateDefaultBuilder(args)
+                    .UseSerilog()
+                    .ConfigureServices(services =>
+                    {
+                        services.AddDbContext<DBServerContext>(opt =>
+                            opt.UseSqlServer(connectionString),
+                            contextLifetime: ServiceLifetime.Scoped);
+
+                        services.AddScoped<Job>();
+                        services.AddScoped<XmlConsumer>();
+                        services.AddScoped<CompareToolJobProcessorService>();
+                        services.AddScoped<JobDetailsService>();
+                    })
+                    .Build();
+
+                // Execute logic
+                using var scope = host.Services.CreateScope();
+                var consumer = scope.ServiceProvider.GetRequiredService<XmlConsumer>();
+
+                string xml = "(14993836, <message><Request_Number>14993836</Request_Number><Sender>BTE System</Sender></message>)";
+                string tableName = "BTE_CompareTool_Main_Request";
+
+                Log.Information("Executing XML Consumer...");
+                await consumer.ProcessXmlAsync(xml, tableName);
+
+                Log.Information("✅ CompareTool Console Completed Successfully ✅");
+            }
+            catch (Exception ex)
+            {
+                Log.Fatal(ex, "❌ Console crashed with unhandled exception.");
+            }
+            finally
+            {
+                Log.CloseAndFlush();
+            }
         }
     }
 }
