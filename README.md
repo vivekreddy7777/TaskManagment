@@ -1,16 +1,43 @@
-services.AddSingleton<CBMBPLProcessorService>();
-services.AddSingleton<CCRCL100ProcessorService>();
-services.AddSingleton<CCRCL200ProcessorService>();
-services.AddSingleton<CCRCPR00ProcessorService>();
-services.AddSingleton<CCRSMG00ProcessorService>();
-services.AddSingleton<CDRRUL00ProcessorService>();
-services.AddSingleton<CSTRuleProcessorService>();
-services.AddSingleton<IWDurRuleProcessorService>();
-services.AddSingleton<POSINQ00ProcessorService>();
-services.AddSingleton<PrepWorkProcessorService>();
 
-// ── Pipeline helpers / wrappers ───────────────────────────────────────────────
-services.AddSingleton<CallCompareToolService>();
-services.AddSingleton<CompareToolBulkInsert2Service>();
-services.AddSingleton<CompareToolExportService>();
-services.AddSingleton<WorkFolderService>();
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+
+namespace BTA_CompareTool_Console.Services
+{
+    public class SystemVariableService
+    {
+        private readonly CompareToolConsoleDbContext _dbContext;
+
+        public SystemVariableService(CompareToolConsoleDbContext dbContext)
+        {
+            _dbContext = dbContext;
+        }
+
+        private static string? CleanInput(string? input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return input;
+
+            return input.Trim().Trim('\"', '“', '”', '\'', '‘', '’');
+        }
+
+        public async Task<string?> GetAsync(string variable, string module, CancellationToken ct = default)
+        {
+            var v = CleanInput(variable);
+            var m = CleanInput(module);
+
+            const string sql = "SELECT dbo.fn_SystemVariable(@var, @mod) AS Value";
+
+            var result = await _dbContext.Database
+                .SqlQuery<string>(
+                    sql,
+                    new SqlParameter("@var", v ?? (object)DBNull.Value),
+                    new SqlParameter("@mod", m ?? (object)DBNull.Value))
+                .FirstOrDefaultAsync(ct);
+
+            return result;
+        }
+    }
+}
