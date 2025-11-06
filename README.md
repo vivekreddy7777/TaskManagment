@@ -1,88 +1,64 @@
+// 2. Convert Excel → TXT using ClosedXML (no Excel/Interop required)
+var tempTxt = Path.ChangeExtension(tempExcel, ".txt");
+_logger.LogInformation("Converting Excel to TXT: {Output}", tempTxt);
 
-public async Task<CompareToolJobModel> LoadInputFileAsync(CompareToolJobModel job, CancellationToken ct = default)
+try
 {
-    _logger.LogInformation("LoadInputFile started");
+    XlsxToTxt.Convert(tempExcel, tempTxt, _logger);
+    _logger.LogInformation("TXT created successfully: {Txt}", tempTxt);
+}
+catch (Exception ex)
+{
+    _logger.LogError(ex, "Excel conversion failed. ExcelPath: {ExcelPath}, TxtPath: {TxtPath}", tempExcel, tempTxt);
+    throw;
+}
 
-    // --- Resolve work root (fallback to app directory) ---
-    string? workRoot = await _systemVariableService.GetAsync("WorkFolder", "ALL");
-    workRoot = string.IsNullOrWhiteSpace(workRoot) ? BTAServiceHost.AppDirectory : workRoot;
+// Update job file reference
+location.CurrentFilePath = tempTxt;
+job.FileName = tempTxt; // for console mode
 
-    // Make sure the actual folder (not only the drive root) exists
-    Directory.CreateDirectory(workRoot);
 
-    // Optional guard: if the path has a drive letter that doesn't exist, fail early
-    var driveRoot = Path.GetPathRoot(workRoot);
-    if (!string.IsNullOrEmpty(driveRoot) &&
-        driveRoot.EndsWith(@":\", StringComparison.Ordinal) &&
-        !Directory.Exists(driveRoot))
+using ClosedXML.Excel;
+using System.Text;
+
+public static class XlsxToTxt
+{
+    public static void Convert(string xlsxPath, string txtPath, ILogger logger)
     {
-        throw new DirectoryNotFoundException($"Work drive not found: {driveRoot}");
-    }
+        Directory.CreateDirectory(Path.GetDirectoryName(txtPath)!);
 
-    if (string.IsNullOrWhiteSpace(job.InputSourcePath))
-        throw new InvalidOperationException("InputSourcePath is not set.");
+        using var wb = new XLWorkbook(xlsxPath);
+        var ws = wb.Worksheets.Worksheet(1);
 
-    // --- Normalize input path (map F:\Intranet → UNC) ---
-    if (job.InputSourcePath.StartsWith(@"F:\Intranet", StringComparison.OrdinalIgnoreCase))
-    {
-        const string serverName = @"\\CH3MP0110685";
-        var relative = job.InputSourcePath.Substring(@"F:\Intranet".Length).TrimStart('\\');
-        job.InputSourcePath = Path.Combine(serverName, "Intranet", relative);
-    }
+        var range = ws.RangeUsed();
+        if (range == null)
+            throw new InvalidOperationException("Excel sheet contains no data.");
 
-    var fileNameNoExt = Path.GetFileNameWithoutExtension(job.InputSourcePath);
-    var extFromInput  = Path.GetExtension(job.InputSourcePath).TrimStart('.');
+        var sb = new StringBuilder();
 
-    if (!string.Equals(extFromInput, "xlsx", StringComparison.OrdinalIgnoreCase))
-    {
-        _logger.LogInformation("Input is not XLSX ({Ext}); skipping Excel conversion.", extFromInput);
-        return job;
-    }
-
-    try
-    {
-        // 1) Temp Excel (local copy)
-        string compareFolder = Path.Combine(workRoot, "Compare");
-        Directory.CreateDirectory(compareFolder);
-
-        string tempExcel = Path.Combine(compareFolder, $"{Guid.NewGuid():N}.xlsx");
-        File.Copy(job.InputSourcePath, tempExcel, overwrite: true);
-        _logger.LogInformation("Copied input Excel: {src} → {dst}", job.InputSourcePath, tempExcel);
-
-        // 2) Convert to TXT next to the Excel
-        string tempTxt = Path.ChangeExtension(tempExcel, ".txt");
-        _logger.LogInformation("Converting Excel to text {Output}", tempTxt);
-
-        using (var xl = new ExcelObjects(_logger))
+        foreach (var row in range.Rows())
         {
-            await xl.InitializeAsync();
-            xl.OpenWorkbook(tempExcel, readOnly: true);
-            xl.SaveAsText(tempTxt);
+            bool first = true;
+            foreach (var cell in row.Cells())
+            {
+                if (!first) sb.Append('\t');
+                first = false;
+
+                var value = cell.GetFormattedString()
+                                .Replace("\r", " ")
+                                .Replace("\n", " ")
+                                .Replace("\t", " ");
+
+                sb.Append(value);
+            }
+            sb.AppendLine();
         }
 
-        // 3) Cleanup Excel
-        if (File.Exists(tempExcel))
-            File.Delete(tempExcel);
+        File.WriteAllText(txtPath, sb.ToString(), Encoding.UTF8);
 
-        // 4) Put TXT into the “network” folder (can be the same work root when running locally)
-        string tempNetworkFolder = Path.Combine(workRoot, "CompareOut");
-        if (!Directory.Exists(tempNetworkFolder))               // <-- FIXED
-            Directory.CreateDirectory(tempNetworkFolder);
+        if (!File.Exists(txtPath))
+            throw new IOException($"TXT creation failed: {txtPath}");
 
-        string networkTxt = Path.Combine(tempNetworkFolder, Path.GetFileName(tempTxt));
-        File.Copy(tempTxt, networkTxt, overwrite: true);
-
-        // optional: cleanup local txt after copying
-        // File.Delete(tempTxt);
-
-        job.FileName = networkTxt;
-        _logger.LogInformation("Transfer to Network location (Target): {Target}", job.FileName);
-        _logger.LogInformation("LoadInputFile End");
-        return job;
-    }
-    catch (Exception ex)
-    {
-        _logger.LogError(ex, "LoadInputFile failed.");
-        throw;
+        logger.LogInformation("ClosedXML conversion complete.");
     }
 }
