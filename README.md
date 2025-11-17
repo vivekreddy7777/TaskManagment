@@ -1,50 +1,69 @@
-private async Task StageEntityTableAsync(CancellationToken ct)
-{
-    if (string.IsNullOrWhiteSpace(_tempTableName))
-        throw new InvalidOperationException("TempTableName is not set before StageEntityTableAsync.");
+1️⃣ Connectivity / Database Unreachable
 
-    _log.LogInformation("[PREP] Stage entity table from {TempTable}", _tempTableName);
+“Your request could not be completed because the system was temporarily unable to connect to the reporting database. Please contact the support team with your request number so we can assist you.”
 
-    var sql = $@"
-IF OBJECT_ID('dbo.EntityTbl', 'U') IS NOT NULL
-    DROP TABLE dbo.EntityTbl;
+⸻
 
-CREATE TABLE dbo.EntityTbl
-(
-    CLAIM_ID        VARCHAR(50),
-    COMPARE_CODE    VARCHAR(20),
-    CLAIM_DOS       VARCHAR(20),
-    PHARMACY_ID     VARCHAR(20),
-    CLAIM_RESPONSE  VARCHAR(10),
-    MEMBER_ID       VARCHAR(20),
-    PERSON_NBR      VARCHAR(20),
-    RVRVSD_PTNT_ACN VARCHAR(20)
-);
+2️⃣ SQL Timeout
 
-INSERT INTO dbo.EntityTbl
-(
-    CLAIM_ID,
-    COMPARE_CODE,
-    CLAIM_DOS,
-    PHARMACY_ID,
-    CLAIM_RESPONSE,
-    MEMBER_ID,
-    PERSON_NBR,
-    RVRVSD_PTNT_ACN
-)
-SELECT DISTINCT
-    CLAIM_ID,
-    COMPARE_CODE,
-    CLAIM_DOS,
-    PHARMACY_ID,
-    ClaimResponse,
-    MEMBER_ID,
-    PERSON_NBR,
-    RVRVSD_PTNT_ACN
-FROM [Quality_Control].[dbo].[{_tempTableName}];
-";
+“Your request took longer than expected and was stopped automatically for system performance. Please contact the support team with your request number for further assistance.”
 
-    await _context.Database.ExecuteSqlRawAsync(sql, ct);
+⸻
 
-    _log.LogInformation("[PREP] Stage entity table completed.");
-}
+3️⃣ Missing Table / Stored Procedure / Object
+
+“Your request could not be completed because part of the report configuration is not available in the system. Please contact the support team with your request number so we can resolve this.”
+
+⸻
+
+4️⃣ Data Format / Conversion Issue
+
+“Your request could not be completed due to unexpected data formatting in the source system. Please contact the support team with your request number so we can review the data.”
+
+⸻
+
+5️⃣ Constraint or Data Consistency Issue
+
+“Your request could not be completed because the data did not meet the required consistency rules. Please contact the support team with your request number for assistance.”
+
+⸻
+
+6️⃣ Deadlock / Concurrency Issue
+
+“Your request could not be completed because it conflicted with another active process. Please contact the support team with your request number so we can re-run it for you.”
+
+⸻
+
+7️⃣ Disk Space / Server Resource Issue
+
+“Your request could not be completed due to limited system resources at the time of processing. Please contact the support team with your request number so we can help.”
+
+⸻
+
+8️⃣ File In Use / Locked File
+
+“Your request could not be completed because the required output file was temporarily locked by another process. Please contact the support team with your request number for help.”
+
+⸻
+
+9️⃣ Network Path / File Move Error
+
+“Your request could not be completed because the system could not reach the required network location. Please contact the support team with your request number for assistance.”
+
+⸻
+
+🔟 Template Missing
+
+“Your request could not be completed because the required template file was not available at the time of processing. Please contact the support team with your request number so we can restore the template.”
+
+⸻
+
+1️⃣1️⃣ Internal Processing Error
+
+“Your request could not be completed due to an unexpected processing issue. Please contact the support team with your request number so we can investigate.”
+
+⸻
+
+1️⃣2️⃣ Unknown Error
+
+“Your request could not be completed due to an unexpected system issue. Please contact the support team with your request number for further assistance.”
