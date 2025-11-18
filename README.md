@@ -1,69 +1,277 @@
-1️⃣ Connectivity / Database Unreachable
+using System;
+using System.Data.Common;
+using System.Data.SqlClient;
+using System.IO;
 
-“Your request could not be completed because the system was temporarily unable to connect to the reporting database. Please contact the support team with your request number so we can assist you.”
+namespace BTE_Export_Service
+{
+    public static class CompareToolErrorHelper
+    {
+        public enum ErrorBucket
+        {
+            DatabaseIssue,
+            DataIssue,
+            ServerOrNetworkIssue,
+            UnknownIssue
+        }
 
-⸻
+        public enum ErrorSubType
+        {
+            ConnectivityDatabaseUnreachable,
+            SqlTimeout,
+            MissingObject,
+            DeadlockConcurrency,
+            DataFormatConversion,
+            ConstraintConsistency,
+            DiskSpaceResource,
+            FileLocked,
+            NetworkPathOrMove,
+            TemplateMissing,
+            InternalProcessing,
+            Unknown
+        }
 
-2️⃣ SQL Timeout
+        public class ErrorClassification
+        {
+            public ErrorBucket Bucket { get; private set; }
+            public ErrorSubType SubType { get; private set; }
 
-“Your request took longer than expected and was stopped automatically for system performance. Please contact the support team with your request number for further assistance.”
+            public ErrorClassification(ErrorBucket bucket, ErrorSubType subType)
+            {
+                Bucket = bucket;
+                SubType = subType;
+            }
 
-⸻
+            public override string ToString()
+            {
+                return "Bucket=" + Bucket + "; SubType=" + SubType;
+            }
+        }
 
-3️⃣ Missing Table / Stored Procedure / Object
+        // MAIN ENTRY
+        public static ErrorClassification Classify(Exception ex)
+        {
+            if (ex is SqlException)
+                return ClassifySqlException((SqlException)ex);
 
-“Your request could not be completed because part of the report configuration is not available in the system. Please contact the support team with your request number so we can resolve this.”
+            if (ex is DbException)
+                return new ErrorClassification(ErrorBucket.DatabaseIssue, ErrorSubType.SqlTimeout);
 
-⸻
+            if (ex is IOException)
+                return ClassifyIOException((IOException)ex);
 
-4️⃣ Data Format / Conversion Issue
+            string msg = (ex.Message ?? "").ToLower();
 
-“Your request could not be completed due to unexpected data formatting in the source system. Please contact the support team with your request number so we can review the data.”
+            if (msg.Contains("template") && msg.Contains("not found"))
+                return new ErrorClassification(ErrorBucket.ServerOrNetworkIssue, ErrorSubType.TemplateMissing);
 
-⸻
+            if (msg.Contains("index was outside the bounds"))
+                return new ErrorClassification(ErrorBucket.UnknownIssue, ErrorSubType.InternalProcessing);
 
-5️⃣ Constraint or Data Consistency Issue
+            return new ErrorClassification(ErrorBucket.UnknownIssue, ErrorSubType.Unknown);
+        }
 
-“Your request could not be completed because the data did not meet the required consistency rules. Please contact the support team with your request number for assistance.”
 
-⸻
+        // USER MESSAGE BUILDER
+        public static string BuildUserMessage(ErrorClassification c, long requestNumber)
+        {
+            string baseText;
 
-6️⃣ Deadlock / Concurrency Issue
+            switch (c.Bucket)
+            {
+                case ErrorBucket.DatabaseIssue:
+                    baseText = "Your request could not be completed due to a database issue. Please resubmit your request or open a Tech Triage ticket with your request number, and the following message: ";
+                    break;
 
-“Your request could not be completed because it conflicted with another active process. Please contact the support team with your request number so we can re-run it for you.”
+                case ErrorBucket.DataIssue:
+                    baseText = "Your request could not be completed due to an unexpected data issue. Please resubmit your request or open a Tech Triage ticket with your request number, and the following message: ";
+                    break;
 
-⸻
+                case ErrorBucket.ServerOrNetworkIssue:
+                    baseText = "Your request could not be completed due to a server or network issue. Please resubmit your request or open a Tech Triage ticket with your request number, and the following message: ";
+                    break;
 
-7️⃣ Disk Space / Server Resource Issue
+                default:
+                    baseText = "Your request could not be completed due to an unknown issue. Please resubmit your request or open a Tech Triage ticket with your request number, and the following message: ";
+                    break;
+            }
 
-“Your request could not be completed due to limited system resources at the time of processing. Please contact the support team with your request number so we can help.”
+            return baseText + GetSubTypeLabel(c.SubType);
+        }
 
-⸻
+        public static string BuildDeveloperContext(ErrorClassification c, long requestNumber)
+        {
+            return "Request #" + requestNumber + "; " + c.ToString();
+        }
 
-8️⃣ File In Use / Locked File
+        // SUBTYPE LABEL
+        private static string GetSubTypeLabel(ErrorSubType s)
+        {
+            switch (s)
+            {
+                case ErrorSubType.ConnectivityDatabaseUnreachable: return "Connectivity / Database Unreachable";
+                case ErrorSubType.SqlTimeout: return "SQL Timeout";
+                case ErrorSubType.MissingObject: return "Missing Table / Stored Procedure / Object";
+                case ErrorSubType.DeadlockConcurrency: return "Deadlock / Concurrency Issue";
+                case ErrorSubType.DataFormatConversion: return "Data Format / Conversion Issue";
+                case ErrorSubType.ConstraintConsistency: return "Constraint or Data Consistency Issue";
+                case ErrorSubType.DiskSpaceResource: return "Disk Space / Server Resource Issue";
+                case ErrorSubType.FileLocked: return "File In Use / Locked File";
+                case ErrorSubType.NetworkPathOrMove: return "Network Path / File Move Error";
+                case ErrorSubType.TemplateMissing: return "Template Missing";
+                case ErrorSubType.InternalProcessing: return "Internal Processing Error";
+                default: return "Unknown Issue";
+            }
+        }
 
-“Your request could not be completed because the required output file was temporarily locked by another process. Please contact the support team with your request number for help.”
 
-⸻
+        // SQL CLASSIFIER
+        private static ErrorClassification ClassifySqlException(SqlException ex)
+        {
+            string msg = (ex.Message ?? "").ToLower();
 
-9️⃣ Network Path / File Move Error
+            if (msg.Contains("could not open a connection") || msg.Contains("network"))
+                return new ErrorClassification(ErrorBucket.DatabaseIssue, ErrorSubType.ConnectivityDatabaseUnreachable);
 
-“Your request could not be completed because the system could not reach the required network location. Please contact the support team with your request number for assistance.”
+            if (msg.Contains("timeout"))
+                return new ErrorClassification(ErrorBucket.DatabaseIssue, ErrorSubType.SqlTimeout);
 
-⸻
+            if (msg.Contains("could not find stored procedure") ||
+                msg.Contains("invalid object name"))
+                return new ErrorClassification(ErrorBucket.DatabaseIssue, ErrorSubType.MissingObject);
 
-🔟 Template Missing
+            if (msg.Contains("deadlock"))
+                return new ErrorClassification(ErrorBucket.DatabaseIssue, ErrorSubType.DeadlockConcurrency);
 
-“Your request could not be completed because the required template file was not available at the time of processing. Please contact the support team with your request number so we can restore the template.”
+            if (msg.Contains("conversion failed") || msg.Contains("overflow"))
+                return new ErrorClassification(ErrorBucket.DataIssue, ErrorSubType.DataFormatConversion);
 
-⸻
+            if (msg.Contains("conflicted with") && msg.Contains("constraint"))
+                return new ErrorClassification(ErrorBucket.DataIssue, ErrorSubType.ConstraintConsistency);
 
-1️⃣1️⃣ Internal Processing Error
+            return new ErrorClassification(ErrorBucket.UnknownIssue, ErrorSubType.Unknown);
+        }
 
-“Your request could not be completed due to an unexpected processing issue. Please contact the support team with your request number so we can investigate.”
 
-⸻
+        // IO CLASSIFIER
+        private static ErrorClassification ClassifyIOException(IOException ex)
+        {
+            string msg = (ex.Message ?? "").ToLower();
 
-1️⃣2️⃣ Unknown Error
+            if (msg.Contains("disk"))
+                return new ErrorClassification(ErrorBucket.ServerOrNetworkIssue, ErrorSubType.DiskSpaceResource);
 
-“Your request could not be completed due to an unexpected system issue. Please contact the support team with your request number for further assistance.”
+            if (msg.Contains("being used by another process") || msg.Contains("cannot access the file"))
+                return new ErrorClassification(ErrorBucket.ServerOrNetworkIssue, ErrorSubType.FileLocked);
+
+            if (msg.Contains("network"))
+                return new ErrorClassification(ErrorBucket.ServerOrNetworkIssue, ErrorSubType.NetworkPathOrMove);
+
+            return new ErrorClassification(ErrorBucket.ServerOrNetworkIssue, ErrorSubType.Unknown);
+        }
+    }
+}
+
+--------------
+
+using System;
+using log4net;
+
+namespace BTE_Export_Service
+{
+    public class BteSystemEmailSender
+    {
+        private readonly ILog _log;
+
+        public BteSystemEmailSender(ILog log)
+        {
+            _log = log;
+        }
+
+        public void SendErrorEmailForException(ExportEmailContext ctx, Exception ex)
+        {
+            var classification = CompareToolErrorHelper.Classify(ex);
+
+            string friendlyMessage =
+                CompareToolErrorHelper.BuildUserMessage(classification, ctx.RequestNumber);
+
+            string body = BuildErrorEmailBody(ctx, friendlyMessage);
+
+            string devContext =
+                CompareToolErrorHelper.BuildDeveloperContext(classification, ctx.RequestNumber);
+
+            _log.Error("Export failed. " + devContext, ex);
+
+            QueueSystemEmail(ctx,
+                "BTA Export Service Error (Request # " + ctx.RequestNumber + ")",
+                body);
+        }
+
+
+        private string BuildErrorEmailBody(ExportEmailContext ctx, string friendlyMessage)
+        {
+            string template =
+@"<style>td{{text-align:right;vertical-align:top;padding-right:10;font-weight:bold;white-space:nowrap;}}
+.tdd{{text-align:left;vertical-align:top;}}</style>
+<div style='font-family:Calibri;font-size:11pt;'>
+    <span style='font-weight:bold;'>***IMPORTANT NOTICE***</span><br/><br/>
+    A BTA Export and Reporting file has failed, details are below:<br/><br/>
+    <table border='0' cellspacing='0' cellpadding='0'>
+        <tr><td>Request #:</td><td class='tdd'>{0}</td></tr>
+        <tr><td>Request Date:</td><td class='tdd'>{1}</td></tr>
+        <tr><td>Report Name:</td><td class='tdd'>{2}</td></tr>
+        <tr><td>Requestor Email:</td><td class='tdd'>{3}</td></tr>
+        <tr><td>Requestor LAN ID:</td><td class='tdd'>{4}</td></tr>
+        <tr><td>Error Details:</td><td class='tdd'>{5}</td></tr>
+    </table>
+    <br/>
+    Thank you for using the Export and Reporting Service provided by Q-Core.<br/>
+</div>";
+
+            return string.Format(template,
+                ctx.RequestNumber.ToString(),
+                ctx.RequestedDate.ToString(),
+                ctx.ReportName,
+                ctx.RequestorEmail,
+                ctx.Requestor.Replace("\"", ""),
+                friendlyMessage);
+        }
+
+
+        private void QueueSystemEmail(ExportEmailContext ctx, string subject, string body)
+        {
+            SqlUtilities.ProcCommand(
+                "procBTE_System_Emails_INSERT",
+                new Library
+                {
+                    { "@MailTo", "Q-CoreExpress-Scripts.com" },
+                    { "@MailCC", ctx.ReportOwnerEmail },
+                    { "@MailSubject", subject },
+                    { "@MailBody", body },
+                    { "@Procedure", ctx.ProcedureName }
+                })
+            .Run();
+        }
+    }
+}
+
+
+
+catch (Exception ex)
+{
+    var ctx = new ExportEmailContext
+    {
+        RequestNumber     = request.Request_Number,
+        RequestedDate     = request.Requested_Date,
+        ReportName        = request.Report_Name,
+        Requestor         = request.Requestor,
+        RequestorEmail    = request.Requestor_Email,
+        ReportOwnerEmail  = request.Report_Owner_Email,
+        ProcedureName     = "BTE_Export_Job"
+    };
+
+    var emailSender = new BteSystemEmailSender(_log);
+    emailSender.SendErrorEmailForException(ctx, ex);
+
+    throw;
+}
