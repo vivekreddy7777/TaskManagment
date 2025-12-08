@@ -1,35 +1,20 @@
-USE [Quality_Control];
-GO
+var sql =
+    "UPDATE " + serverDB + ".[dbo].[MCR_GridTracker_SOURCE] " +
+    "SET [CopayGridStatus]    = @CopayGridStatus, " +
+    "    [GridEffectiveDate] = @GridEffectiveDate, " +
+    "    [PlanYear]          = @PlanYear, " +
+    "    [AccumPlatform]     = @AccumPlatform, " +
+    "    [Comments]          = @Comments " +
+    "WHERE [fkMasterID]      = @fkMasterID";
 
-SET ANSI_NULLS ON;
-GO
-SET QUOTED_IDENTIFIER ON;
-GO
+var parameters = new[]
+{
+    new SqlParameter("@CopayGridStatus",   (object?)response.CopayGridStatus   ?? DBNull.Value),
+    new SqlParameter("@GridEffectiveDate", (object?)response.GridEffectiveDate ?? DBNull.Value),
+    new SqlParameter("@PlanYear",          (object?)response.PlanYear          ?? DBNull.Value),
+    new SqlParameter("@AccumPlatform",     (object?)response.AccumPlatform     ?? DBNull.Value),
+    new SqlParameter("@Comments",          (object?)response.Comments          ?? DBNull.Value),
+    new SqlParameter("@fkMasterID",        response.fkMasterID)
+};
 
-/********************************************************************
- Author:        Vivek Reddy Mandadi
- Create date:   2025-12-05
- Description:   When specific MCR_GridTracker columns change,
-                set IsUpdateCompletedinAutoQC = 0.
-*********************************************************************/
-CREATE TRIGGER [dbo].[trg_MCR_GridTracker_Update_AutoQC]
-ON [dbo].[MCR_GridTracker]
-AFTER UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    -- Fire ONLY when any of these columns are updated
-    IF UPDATE(CopayGridStatus)
-       OR UPDATE(GridEffectiveDate)
-       OR UPDATE(PlanYear)
-       OR UPDATE(AccumPlatform)
-       OR UPDATE(Comments)
-    BEGIN
-        UPDATE GT
-        SET IsUpdateCompletedinAutoQC = 0
-        FROM dbo.MCR_GridTracker GT
-        INNER JOIN inserted i ON GT.ID = i.ID;
-    END
-END;
-GO
+await _linkedServerContext.Database.ExecuteSqlRawAsync(sql, parameters);
