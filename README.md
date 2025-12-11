@@ -1,20 +1,28 @@
-var sql =
-    "UPDATE " + serverDB + ".[dbo].[MCR_GridTracker_SOURCE] " +
-    "SET [CopayGridStatus]    = @CopayGridStatus, " +
-    "    [GridEffectiveDate] = @GridEffectiveDate, " +
-    "    [PlanYear]          = @PlanYear, " +
-    "    [AccumPlatform]     = @AccumPlatform, " +
-    "    [Comments]          = @Comments " +
-    "WHERE [fkMasterID]      = @fkMasterID";
+SELECT *
+FROM Quality_Control.MCR_GridTracker
+WHERE sr IS NULL
+  AND planYear >= 2024
+  AND GridType <> 'Draft'
+  AND (
+        -- Scenario 1: Failed Validation + ErrorMsg like '%An error%'
+        (CopayGridStatus = 'Failed Validation'
+         AND ErrorMsg LIKE '%An error%')
 
-var parameters = new[]
-{
-    new SqlParameter("@CopayGridStatus",   (object?)response.CopayGridStatus   ?? DBNull.Value),
-    new SqlParameter("@GridEffectiveDate", (object?)response.GridEffectiveDate ?? DBNull.Value),
-    new SqlParameter("@PlanYear",          (object?)response.PlanYear          ?? DBNull.Value),
-    new SqlParameter("@AccumPlatform",     (object?)response.AccumPlatform     ?? DBNull.Value),
-    new SqlParameter("@Comments",          (object?)response.Comments          ?? DBNull.Value),
-    new SqlParameter("@fkMasterID",        response.fkMasterID)
-};
+        OR
 
-await _linkedServerContext.Database.ExecuteSqlRawAsync(sql, parameters);
+        -- Scenario 2: Not Failed Validation + Processed = 1 + SSLoaded = 0
+        (CopayGridStatus <> 'Failed Validation'
+         AND Processed = 1
+         AND SSLoaded = 0)
+
+        OR
+
+        -- Scenario 3: Processed = 1 + ProcessedOn IS NULL
+        (Processed = 1
+         AND ProcessedOn IS NULL)
+
+        OR
+
+        -- Scenario 4: SSLoaded = 0 and not draft
+        (SSLoaded = 0)
+      );
