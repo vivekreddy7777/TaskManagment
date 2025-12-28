@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Net;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
@@ -6,8 +7,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Serilog;
 
-using CompareTool.Services.Security;   // <-- your existing CyberArk services
-using CompareTool.Services;            // <-- your processor services
+using CompareTool.Services.Security;
+using CompareTool.Services;
 
 namespace CompareTool.ConsoleApp
 {
@@ -27,7 +28,6 @@ namespace CompareTool.ConsoleApp
     {
         public static async Task<int> Main(string[] args)
         {
-            // Enforce TLS 1.2 (important for CyberArk in .NET Framework / mixed stacks)
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
             Log.Logger = new LoggerConfiguration()
@@ -46,52 +46,48 @@ namespace CompareTool.ConsoleApp
                     .AddEnvironmentVariables()
                     .Build();
 
-                Log.Information("Starting CompareTool Console in {Env}", environment);
-
-                // -------------------------------
-                // CyberArk – pull credentials
-                // -------------------------------
+                Log.Information("Starting CompareTool Console | Environment: {Env}", environment);
 
                 var cyberArkProvider =
                     new CyberArkCredentialProvider(configuration);
 
-                var db2Creds =
-                    await cyberArkProvider.GetCredentialsAsync(CredentialKind.Db2);
+                Log.Information("Retrieving credentials from CyberArk...");
 
-                var teradataCreds =
-                    await cyberArkProvider.GetCredentialsAsync(CredentialKind.Teradata);
+                var sw = Stopwatch.StartNew();
 
-                var sqlCreds =
-                    await cyberArkProvider.GetCredentialsAsync(CredentialKind.Sql);
+                var db2Creds = await cyberArkProvider.GetCredentialsAsync(CredentialKind.Db2);
+                Log.Information("CyberArk credentials retrieved for DB2");
 
-                // Store locally in Program.cs (in-memory only)
+                var teradataCreds = await cyberArkProvider.GetCredentialsAsync(CredentialKind.Teradata);
+                Log.Information("CyberArk credentials retrieved for Teradata");
+
+                var sqlCreds = await cyberArkProvider.GetCredentialsAsync(CredentialKind.Sql);
+                Log.Information("CyberArk credentials retrieved for SQL Server");
+
+                sw.Stop();
+                Log.Information(
+                    "CyberArk credential retrieval completed in {ElapsedMs} ms",
+                    sw.ElapsedMilliseconds);
+
                 var runtimeContext = new RuntimeContext
                 {
                     Db2User = db2Creds.User,
                     Db2Password = db2Creds.Password,
-
                     TeradataUser = teradataCreds.User,
                     TeradataPassword = teradataCreds.Password,
-
                     SqlUser = sqlCreds.User,
                     SqlPassword = sqlCreds.Password
                 };
 
-                // -------------------------------
-                // Host + DI
-                // -------------------------------
+                Log.Information("Runtime credential context initialized successfully");
 
                 using IHost host = Host.CreateDefaultBuilder(args)
                     .UseSerilog()
                     .ConfigureServices((_, services) =>
                     {
-                        // expose IConfiguration
                         services.AddSingleton(configuration);
-
-                        // expose CyberArk runtime values to the app
                         services.AddSingleton(runtimeContext);
 
-                        // register your existing services
                         services.AddScoped<CallCompareToolService>();
                         services.AddScoped<CompareToolJobProcessorService>();
                         services.AddScoped<CompareToolExportService>();
@@ -106,22 +102,20 @@ namespace CompareTool.ConsoleApp
                     })
                     .Build();
 
-                // -------------------------------
-                // Application entry execution
-                // -------------------------------
-
                 using var scope = host.Services.CreateScope();
 
                 var jobProcessor =
                     scope.ServiceProvider.GetRequiredService<CompareToolJobProcessorService>();
 
+                Log.Information("Starting CompareTool job execution");
                 await jobProcessor.ExecuteAsync();
+                Log.Information("CompareTool job execution completed successfully");
 
                 return 0;
             }
             catch (Exception ex)
             {
-                Log.Fatal(ex, "CompareTool Console failed.");
+                Log.Fatal(ex, "CompareTool Console failed");
                 return 1;
             }
             finally
