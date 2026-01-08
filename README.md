@@ -1,6 +1,6 @@
 private async Task DebugDb2WhichColumnAsync(string sql, CancellationToken ct)
 {
-    await using var conn = new DB2Connection(_db2ConnectionString);
+    await using var conn = new DB2Connection(_db2Connection.ConnectionString);
     await conn.OpenAsync(ct);
 
     await using var cmd = conn.CreateCommand();
@@ -8,34 +8,37 @@ private async Task DebugDb2WhichColumnAsync(string sql, CancellationToken ct)
 
     await using var reader = await cmd.ExecuteReaderAsync(ct);
 
-    while (await reader.ReadAsync(ct))
+    if (!await reader.ReadAsync(ct))
     {
-        for (int i = 0; i < reader.FieldCount; i++)
+        _log.LogWarning("[DB2 DEBUG] No rows returned.");
+        return;
+    }
+
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        var name = reader.GetName(i);
+        var db2Type = reader.GetDataTypeName(i);
+
+        try
         {
-            string colName = reader.GetName(i);
-            string db2Type = reader.GetDataTypeName(i);
+            // Reproduce EF’s failing call path
+            var dec = reader.GetDecimal(i);
 
-            try
-            {
-                // IMPORTANT: GetValue reads the raw value without forcing decimal conversion
-                object val = reader.GetValue(i);
-
-                // Optional: if you want to reproduce exact failing path, try decimal conversion:
-                // var d = reader.GetDecimal(i);
-
-                _log.LogDebug("OK col[{Idx}] {Name} ({Type}) = {Val}",
-                    i, colName, db2Type, val == DBNull.Value ? "NULL" : val);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex,
-                    "FAIL col[{Idx}] {Name} ({Type})",
-                    i, colName, db2Type);
-
-                throw; // stop at first failing column
-            }
+            _log.LogInformation("[DB2 DEBUG] OK DECIMAL Col[{Idx}] {Name} ({Type}) = {Val}",
+                i, name, db2Type, dec);
         }
+        catch (Exception ex)
+        {
+            // Log raw value too (without forcing decimal)
+            object raw;
+            try { raw = reader.GetValue(i); }
+            catch { raw = "<unable to read>"; }
 
-        break; // one row is enough to identify the column
+            _log.LogError(ex,
+                "[DB2 DEBUG] FAIL GetDecimal at Col[{Idx}] {Name} ({Type}). Raw={Raw}",
+                i, name, db2Type, raw == DBNull.Value ? "NULL" : raw);
+
+            throw; // stop at first failing column
+        }
     }
 }
