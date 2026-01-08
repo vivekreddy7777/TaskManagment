@@ -1,10 +1,6 @@
 private async Task DebugDb2WhichColumnAsync(string sql, CancellationToken ct)
 {
-    // Use your DB2 connection string variable; adjust name if needed.
-    // If you currently store a DB2Connection object, use .ConnectionString.
-    var connStr = _db2Connection.ConnectionString;
-
-    await using var conn = new DB2Connection(connStr);
+    await using var conn = new DB2Connection(_db2Connection.ConnectionString);
     await conn.OpenAsync(ct);
 
     await using var cmd = conn.CreateCommand();
@@ -15,11 +11,11 @@ private async Task DebugDb2WhichColumnAsync(string sql, CancellationToken ct)
 
     if (!await reader.ReadAsync(ct))
     {
-        _log.LogWarning("[DB2 DEBUG] No rows returned for diagnostic query.");
+        _log.LogWarning("[DB2 DEBUG] No rows returned.");
         return;
     }
 
-    // Build property map from your EF keyless DTO
+    // Map model property -> type (case-insensitive)
     var propMap = typeof(CcrSmgRow)
         .GetProperties(BindingFlags.Public | BindingFlags.Instance)
         .Where(p => p.CanWrite)
@@ -29,53 +25,49 @@ private async Task DebugDb2WhichColumnAsync(string sql, CancellationToken ct)
 
     for (int i = 0; i < reader.FieldCount; i++)
     {
-        string colName = reader.GetName(i);
-        string db2TypeName = Safe(() => reader.GetDataTypeName(i), "<unknown>");
-        Type actualDotNetType = Safe(() => reader.GetFieldType(i), typeof(object));
+        var colName = reader.GetName(i);
+        var db2Type = reader.GetDataTypeName(i);
+        var fieldType = reader.GetFieldType(i);
 
-        // If your SELECT returns a column that doesn't exist on the model, log it.
         if (!propMap.TryGetValue(colName, out var expectedType))
         {
-            object rawExtra = Safe(() => reader.GetValue(i), "<unreadable>");
+            object rawExtra = reader.IsDBNull(i) ? DBNull.Value : reader.GetValue(i);
             _log.LogWarning(
                 "[DB2 DEBUG] Column not in model: Col[{Idx}] {Col} DB2Type={Db2Type} FieldType={FieldType} Raw={Raw}",
-                i, colName, db2TypeName, actualDotNetType.Name, FormatRaw(rawExtra));
+                i, colName, db2Type, fieldType.Name, rawExtra == DBNull.Value ? "DBNULL" : rawExtra);
             continue;
         }
 
         try
         {
-            // IMPORTANT: mimic EF getter choice based on the model property type
-            object value = ReadAsExpectedType(reader, i, expectedType);
+            object val = ReadAsExpectedType(reader, i, expectedType);
 
             _log.LogInformation(
-                "[DB2 DEBUG] OK Col[{Idx}] {Col} DB2Type={Db2Type} FieldType={FieldType} Expected={Expected} Value={Val}",
-                i, colName, db2TypeName, actualDotNetType.Name, FriendlyType(expectedType), FormatRaw(value));
+                "[DB2 DEBUG] OK Col[{Idx}] {Col} DB2Type={Db2Type} FieldType={FieldType} Expected={Expected} Val={Val}",
+                i, colName, db2Type, fieldType.Name, FriendlyType(expectedType),
+                val == DBNull.Value ? "DBNULL" : val);
         }
         catch (Exception ex)
         {
-            object raw = Safe(() => reader.GetValue(i), "<unreadable>");
+            object raw;
+            try { raw = reader.GetValue(i); }
+            catch { raw = "<unreadable>"; }
 
             _log.LogError(ex,
                 "[DB2 DEBUG] FAIL Col[{Idx}] {Col} DB2Type={Db2Type} FieldType={FieldType} Expected={Expected} Raw={Raw}",
-                i, colName, db2TypeName, actualDotNetType.Name, FriendlyType(expectedType), FormatRaw(raw));
+                i, colName, db2Type, fieldType.Name, FriendlyType(expectedType),
+                raw == DBNull.Value ? "DBNULL" : raw);
 
-            // Stop at the first failing column so you can fix it quickly
-            throw;
+            throw; // stop at first real mismatch
         }
     }
 }
 
-/// <summary>
-/// Reads a column using the getter implied by the expected .NET type (like EF would).
-/// Handles nulls and nullable types.
-/// </summary>
 private static object ReadAsExpectedType(DB2DataReader reader, int ordinal, Type expectedType)
 {
     if (reader.IsDBNull(ordinal))
         return DBNull.Value;
 
-    // unwrap Nullable<T>
     var t = Nullable.GetUnderlyingType(expectedType) ?? expectedType;
 
     if (t == typeof(string)) return reader.GetString(ordinal);
@@ -89,7 +81,6 @@ private static object ReadAsExpectedType(DB2DataReader reader, int ordinal, Type
     if (t == typeof(DateTime)) return reader.GetDateTime(ordinal);
     if (t == typeof(Guid)) return reader.GetGuid(ordinal);
 
-    // Fallback: raw object
     return reader.GetValue(ordinal);
 }
 
@@ -97,17 +88,4 @@ private static string FriendlyType(Type t)
 {
     var u = Nullable.GetUnderlyingType(t);
     return u == null ? t.Name : $"{u.Name}?";
-}
-
-private static string FormatRaw(object val)
-{
-    if (val == null) return "NULL";
-    if (val == DBNull.Value) return "DBNULL";
-    return val.ToString();
-}
-
-private static T Safe<T>(Func<T> func, T fallback)
-{
-    try { return func(); }
-    catch { return fallback; }
 }
