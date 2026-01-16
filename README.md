@@ -1,38 +1,76 @@
-DECLARE @RulesOrClause NVARCHAR(MAX);
+// Assume these are already retrieved from CyberArk
+string sqlUser = runtimeContext.SqlUser;
+string sqlPassword = runtimeContext.SqlPassword;
 
-;WITH RulesRaw AS
-(
-    SELECT
-        RuleBody =
-            LTRIM(
-                CASE
-                    WHEN LEFT(LTRIM(priorityRuleSQLWhere), 5) = 'WHERE'
-                        THEN SUBSTRING(LTRIM(priorityRuleSQLWhere), 6, LEN(LTRIM(priorityRuleSQLWhere)))
-                    ELSE LTRIM(priorityRuleSQLWhere)
-                END
-            )
-    FROM dbo.tbl_AutoAssign_Priority_Rules
-    WHERE priorityRuleSQLWhere IS NOT NULL
-      AND LTRIM(RTRIM(priorityRuleSQLWhere)) <> ''
-),
-Rules AS
-(
-    SELECT
-        RuleBody =
-            CASE
-                WHEN LEFT(LTRIM(RuleBody), 2) = 'OR'
-                    THEN LTRIM(SUBSTRING(LTRIM(RuleBody), 3, LEN(LTRIM(RuleBody))))
-                WHEN LEFT(LTRIM(RuleBody), 3) = 'AND'
-                    THEN LTRIM(SUBSTRING(LTRIM(RuleBody), 4, LEN(LTRIM(RuleBody))))
-                ELSE RuleBody
-            END
-    FROM RulesRaw
-)
-SELECT
-    @RulesOrClause = STRING_AGG(RuleBody, ' OR ')
-FROM Rules;
+string db2User = runtimeContext.Db2User;
+string db2Password = runtimeContext.Db2Password;
 
-IF @RulesOrClause IS NOT NULL AND LEN(@RulesOrClause) > 0
-BEGIN
-    SET @SQLWhere = @SQLWhere + CHAR(10) + ' AND ( ' + @RulesOrClause + ' )';
-END
+string teradataUser = runtimeContext.TeradataUser;
+string teradataPassword = runtimeContext.TeradataPassword;
+
+
+// ======================
+// SQL SERVER
+// ======================
+
+// Base SQL connection string from config server (NO credentials)
+string sqlBaseConnString = mergedConfig["QCoreDBConnectionString"];
+
+// Build SQL connection string with CyberArk creds
+var sqlBuilder = new SqlConnectionStringBuilder(sqlBaseConnString)
+{
+    UserID = sqlUser,
+    Password = sqlPassword,
+    IntegratedSecurity = false,
+    TrustServerCertificate = true,
+    Encrypt = true
+};
+
+string sqlConnectionString = sqlBuilder.ConnectionString;
+
+
+// ======================
+// DB2
+// ======================
+
+// Values from config server
+string db2Server = mergedConfig["Db2Server"];
+string db2Port = mergedConfig["Db2Port"];
+string db2Database = mergedConfig["Db2Database"];
+
+// Build DB2 connection string
+string db2ConnectionString =
+    $"Server={db2Server}:{db2Port};" +
+    $"Database={db2Database};" +
+    $"UID={db2User};" +
+    $"PWD={db2Password};";
+
+
+// ======================
+// TERADATA
+// ======================
+
+// Value from config server
+string teradataServer = mergedConfig["TeradataServer"];
+
+// Build Teradata connection string
+string teradataConnectionString =
+    $"Data Source={teradataServer};" +
+    $"User ID={teradataUser};" +
+    $"Password={teradataPassword};";
+
+
+// ======================
+// OPTIONAL: STORE IN RUNTIME CONTEXT
+// ======================
+
+runtimeContext.SqlConnectionString = sqlConnectionString;
+runtimeContext.Db2ConnectionString = db2ConnectionString;
+runtimeContext.TeradataConnectionString = teradataConnectionString;
+
+
+// ======================
+// OPTIONAL: SAFE VERIFICATION (NO SECRETS)
+// ======================
+
+Log.Information("Connection strings built successfully using CyberArk credentials");
